@@ -87,6 +87,7 @@ import {
 } from "../system-prompt.js";
 import { splitSdkTools } from "../tool-split.js";
 import { describeUnknownError, mapThinkingLevel } from "../utils.js";
+import { flushPendingToolResultsAfterIdle } from "../wait-for-idle-before-flush.js";
 import { detectAndLoadPromptImages } from "./images.js";
 
 export function injectHistoryImagesIntoMessages(
@@ -565,19 +566,10 @@ export async function runEmbeddedAttempt(
           activeSession.agent.replaceMessages(limited);
         }
       } catch (err) {
-        // Wait for agent idle before flushing to avoid the same race condition
-        // as the main finally block (see comment below).
-        if (activeSession?.agent?.waitForIdle) {
-          try {
-            await Promise.race([
-              activeSession.agent.waitForIdle(),
-              new Promise<void>((resolve) => setTimeout(resolve, 30_000)),
-            ]);
-          } catch {
-            /* best-effort */
-          }
-        }
-        sessionManager.flushPendingToolResults?.();
+        await flushPendingToolResultsAfterIdle({
+          agent: activeSession?.agent,
+          sessionManager,
+        });
         activeSession.dispose();
         throw err;
       }
@@ -936,17 +928,10 @@ export async function runEmbeddedAttempt(
       // flushPendingToolResults() fires while tools are still executing, inserting
       // synthetic "missing tool result" errors and causing silent agent failures.
       // See: https://github.com/openclaw/openclaw/issues/8643
-      if (session?.agent?.waitForIdle) {
-        try {
-          await Promise.race([
-            session.agent.waitForIdle(),
-            new Promise((resolve) => setTimeout(resolve, 30_000)), // safety timeout
-          ]);
-        } catch {
-          // Ignore errors during idle wait — we're in cleanup
-        }
-      }
-      sessionManager?.flushPendingToolResults?.();
+      await flushPendingToolResultsAfterIdle({
+        agent: session?.agent,
+        sessionManager,
+      });
       session?.dispose();
       await sessionLock.release();
     }

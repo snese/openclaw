@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { flushPendingToolResultsAfterIdle } from "./pi-embedded-runner/wait-for-idle-before-flush.js";
 import { guardSessionManager } from "./session-tool-result-guard-wrapper.js";
 
 function assistantToolCall(id: string): AgentMessage {
@@ -20,57 +21,71 @@ function toolResult(id: string, text: string): AgentMessage {
   } as AgentMessage;
 }
 
-describe("waitForIdle before flush prevents premature synthetic results", () => {
-  it("should not flush pending tool results while agent is still executing tools", async () => {
-    // Simulates the race condition: a tool call is registered but the tool
-    // hasn't finished executing yet. If we flush immediately, we get a
-    // synthetic error. If we wait for idle first, the real result arrives.
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+function getMessages(sm: ReturnType<typeof guardSessionManager>): AgentMessage[] {
+  return sm
+    .getEntries()
+    .filter((e) => e.type === "message")
+    .map((e) => (e as { message: AgentMessage }).message);
+}
+
+describe("flushPendingToolResultsAfterIdle", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("waits for idle so real tool results can land before flush", async () => {
     const sm = guardSessionManager(SessionManager.inMemory());
+    const idle = deferred<void>();
+    const agent = { waitForIdle: () => idle.promise };
 
-    // Assistant makes a tool call (from a retry after overloaded_error)
     sm.appendMessage(assistantToolCall("call_retry_1"));
+    const flushPromise = flushPendingToolResultsAfterIdle({
+      agent,
+      sessionManager: sm,
+      timeoutMs: 1_000,
+    });
 
-    // Simulate: tool is still executing (result hasn't arrived yet)
-    // If we flush now, we'd get a synthetic error — this is the bug
-    const entriesBefore = sm
-      .getEntries()
-      .filter((e) => e.type === "message")
-      .map((e) => (e as { message: AgentMessage }).message);
+    // Flush is waiting for idle; synthetic result must not appear yet.
+    await Promise.resolve();
+    expect(getMessages(sm).map((m) => m.role)).toEqual(["assistant"]);
 
-    // Only the assistant message should exist, no synthetic result yet
-    expect(entriesBefore.length).toBe(1);
-    expect(entriesBefore[0].role).toBe("assistant");
-
-    // Now the real tool result arrives (tool finished executing)
+    // Tool completes before idle wait finishes.
     sm.appendMessage(toolResult("call_retry_1", "command output here"));
+    idle.resolve();
+    await flushPromise;
 
-    const entriesAfter = sm
-      .getEntries()
-      .filter((e) => e.type === "message")
-      .map((e) => (e as { message: AgentMessage }).message);
-
-    // Should have assistant + real tool result, no synthetic error
-    expect(entriesAfter.length).toBe(2);
-    expect(entriesAfter[1].role).toBe("toolResult");
-    expect((entriesAfter[1] as { isError?: boolean }).isError).not.toBe(true);
-    expect((entriesAfter[1] as { content?: Array<{ text?: string }> }).content?.[0]?.text).toBe(
+    const messages = getMessages(sm);
+    expect(messages.map((m) => m.role)).toEqual(["assistant", "toolResult"]);
+    expect((messages[1] as { isError?: boolean }).isError).not.toBe(true);
+    expect((messages[1] as { content?: Array<{ text?: string }> }).content?.[0]?.text).toBe(
       "command output here",
     );
   });
 
-  it("flush inserts synthetic error when tool result never arrives", () => {
-    // Validates that flush still works correctly for genuinely orphaned tool calls
+  it("flushes pending tool call after timeout when idle never resolves", async () => {
     const sm = guardSessionManager(SessionManager.inMemory());
+    vi.useFakeTimers();
+    const agent = { waitForIdle: () => new Promise<void>(() => {}) };
 
     sm.appendMessage(assistantToolCall("call_orphan_1"));
 
-    // Tool never executes — flush should insert synthetic error
-    sm.flushPendingToolResults?.();
+    const flushPromise = flushPendingToolResultsAfterIdle({
+      agent,
+      sessionManager: sm,
+      timeoutMs: 30,
+    });
+    await vi.advanceTimersByTimeAsync(30);
+    await flushPromise;
 
-    const entries = sm
-      .getEntries()
-      .filter((e) => e.type === "message")
-      .map((e) => (e as { message: AgentMessage }).message);
+    const entries = getMessages(sm);
 
     expect(entries.length).toBe(2);
     expect(entries[1].role).toBe("toolResult");
@@ -80,25 +95,18 @@ describe("waitForIdle before flush prevents premature synthetic results", () => 
     );
   });
 
-  it("flush is a no-op after real tool result arrives", () => {
-    // If the tool result arrived in time, flush should do nothing
+  it("clears timeout handle when waitForIdle resolves first", async () => {
     const sm = guardSessionManager(SessionManager.inMemory());
+    vi.useFakeTimers();
+    const agent = {
+      waitForIdle: async () => {},
+    };
 
-    sm.appendMessage(assistantToolCall("call_ok_1"));
-    sm.appendMessage(toolResult("call_ok_1", "success"));
-
-    // Flush after result already arrived — should be a no-op
-    sm.flushPendingToolResults?.();
-
-    const entries = sm
-      .getEntries()
-      .filter((e) => e.type === "message")
-      .map((e) => (e as { message: AgentMessage }).message);
-
-    // Should still be just 2 messages, no extra synthetic result
-    expect(entries.length).toBe(2);
-    expect(entries[0].role).toBe("assistant");
-    expect(entries[1].role).toBe("toolResult");
-    expect((entries[1] as { isError?: boolean }).isError).not.toBe(true);
+    await flushPendingToolResultsAfterIdle({
+      agent,
+      sessionManager: sm,
+      timeoutMs: 30_000,
+    });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
