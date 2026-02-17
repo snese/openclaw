@@ -1125,7 +1125,10 @@ export async function createForumTopicTelegram(
     accountId: opts.accountId,
   });
   const token = resolveToken(opts.token, account);
-  const normalizedChatId = normalizeChatId(chatId);
+  // Accept topic-qualified targets (e.g. telegram:group:<id>:topic:<thread>)
+  // but createForumTopic must always target the base supergroup chat id.
+  const target = parseTelegramTarget(chatId);
+  const normalizedChatId = normalizeChatId(target.chatId);
   const client = resolveTelegramClientOptions(account);
   const api = opts.api ?? new Bot(token, client ? { client } : undefined).api;
 

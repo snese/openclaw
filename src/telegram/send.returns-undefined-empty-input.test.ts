@@ -8,7 +8,7 @@ import {
 installTelegramSendTestHooks();
 
 const { botApi, botCtorSpy, loadConfig, loadWebMedia } = getTelegramSendTestMocks();
-const { buildInlineKeyboard, sendMessageTelegram, sendStickerTelegram } =
+const { buildInlineKeyboard, createForumTopicTelegram, sendMessageTelegram, sendStickerTelegram } =
   await importTelegramSendModule();
 
 describe("buildInlineKeyboard", () => {
@@ -847,5 +847,51 @@ describe("sendStickerTelegram", () => {
     });
 
     expect(sendSticker).toHaveBeenCalledWith(chatId, "fileId123", undefined);
+  });
+});
+
+describe("createForumTopicTelegram", () => {
+  it("uses base chat id when target includes topic suffix", async () => {
+    const createForumTopic = vi.fn().mockResolvedValue({
+      message_thread_id: 272,
+      name: "Build Updates",
+    });
+    const api = { createForumTopic } as unknown as {
+      createForumTopic: typeof createForumTopic;
+    };
+
+    const result = await createForumTopicTelegram("telegram:group:-1001234567890:topic:271", "x", {
+      token: "tok",
+      api,
+    });
+
+    expect(createForumTopic).toHaveBeenCalledWith("-1001234567890", "x", undefined);
+    expect(result).toEqual({
+      topicId: 272,
+      name: "Build Updates",
+      chatId: "-1001234567890",
+    });
+  });
+
+  it("forwards optional icon fields", async () => {
+    const createForumTopic = vi.fn().mockResolvedValue({
+      message_thread_id: 300,
+      name: "Roadmap",
+    });
+    const api = { createForumTopic } as unknown as {
+      createForumTopic: typeof createForumTopic;
+    };
+
+    await createForumTopicTelegram("-1001234567890", "Roadmap", {
+      token: "tok",
+      api,
+      iconColor: 0x6fb9f0,
+      iconCustomEmojiId: "  1234567890  ",
+    });
+
+    expect(createForumTopic).toHaveBeenCalledWith("-1001234567890", "Roadmap", {
+      icon_color: 0x6fb9f0,
+      icon_custom_emoji_id: "1234567890",
+    });
   });
 });
