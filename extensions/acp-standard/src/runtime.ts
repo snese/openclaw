@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { Readable, Writable } from "node:stream";
+import type { Writable } from "node:stream";
 import type {
   AcpRuntime,
   AcpRuntimeCapabilities,
@@ -226,17 +226,13 @@ export class StandardAcpRuntime implements AcpRuntime {
     const child = spawn(this.config.command, this.config.args, {
       cwd: this.config.cwd,
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...this.config.env },
     });
 
     // stdio: ["pipe","pipe","pipe"] guarantees these are non-null.
     const stdin = child.stdin!;
     const stdout = child.stdout!;
     const stderr = child.stderr!;
-
-    // Merge config env on top of inherited env.
-    if (this.config.env && Object.keys(this.config.env).length > 0) {
-      // env was set at spawn time via the env option; handled below.
-    }
 
     const agent: AgentProcess = {
       child,
