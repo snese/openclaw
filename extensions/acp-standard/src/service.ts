@@ -31,7 +31,9 @@ export function createStandardAcpService(params: {
         runtime,
         healthy: () => runtime?.isHealthy() ?? false,
       });
-      ctx.logger.info(`acp-standard backend registered (${config.command} ${config.args.join(" ")})`);
+      ctx.logger.info(
+        `acp-standard backend registered (${config.command} ${config.args.join(" ")})`,
+      );
 
       void (async () => {
         try {
@@ -42,7 +44,9 @@ export function createStandardAcpService(params: {
             ctx.logger.warn("acp-standard backend probe failed");
           }
         } catch (err) {
-          ctx.logger.warn(`acp-standard setup failed: ${err instanceof Error ? err.message : String(err)}`);
+          ctx.logger.warn(
+            `acp-standard setup failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       })();
     },

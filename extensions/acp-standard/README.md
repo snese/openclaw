@@ -35,31 +35,31 @@ Configure in `openclaw.json`:
         config: {
           command: "kiro-cli",
           args: ["acp"],
-        }
-      }
-    }
-  }
+        },
+      },
+    },
+  },
 }
 ```
 
 ## Config options
 
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `command` | string | `"kiro-cli"` | Agent binary command |
-| `args` | string[] | `["acp"]` | Arguments to start ACP mode |
-| `cwd` | string | workspace dir | Working directory |
-| `env` | object | `{}` | Extra environment variables |
+| Key       | Type     | Default       | Description                 |
+| --------- | -------- | ------------- | --------------------------- |
+| `command` | string   | `"kiro-cli"`  | Agent binary command        |
+| `args`    | string[] | `["acp"]`     | Arguments to start ACP mode |
+| `cwd`     | string   | workspace dir | Working directory           |
+| `env`     | object   | `{}`          | Extra environment variables |
 
 ## Protocol mapping
 
-| OpenClaw AcpRuntime | Standard ACP JSON-RPC 2.0 |
-|---------------------|---------------------------|
-| `ensureSession()` | `initialize` + `session/new` |
-| `runTurn()` | `session/prompt` → stream `session/update` |
-| `cancel()` | `session/cancel` |
-| `close()` | SIGTERM agent process |
-| `setMode()` | `session/set_mode` |
+| OpenClaw AcpRuntime | Standard ACP JSON-RPC 2.0                  |
+| ------------------- | ------------------------------------------ |
+| `ensureSession()`   | `initialize` + `session/new`               |
+| `runTurn()`         | `session/prompt` → stream `session/update` |
+| `cancel()`          | `session/cancel`                           |
+| `close()`           | SIGTERM agent process                      |
+| `setMode()`         | `session/set_mode`                         |
 
 ## Related
 

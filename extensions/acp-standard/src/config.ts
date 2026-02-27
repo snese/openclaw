@@ -23,7 +23,10 @@ export function createStandardAcpConfigSchema(): OpenClawPluginConfigSchema {
     safeParse(value: unknown) {
       if (value === undefined) return { success: true, data: undefined };
       if (!isRecord(value)) {
-        return { success: false, error: { issues: [{ path: [], message: "expected config object" }] } };
+        return {
+          success: false,
+          error: { issues: [{ path: [], message: "expected config object" }] },
+        };
       }
       return { success: true, data: value };
     },

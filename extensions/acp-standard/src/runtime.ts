@@ -1,20 +1,22 @@
-import { createInterface } from "node:readline";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
 import type {
   AcpRuntime,
   AcpRuntimeCapabilities,
+  AcpRuntimeDoctorReport,
   AcpRuntimeEnsureInput,
   AcpRuntimeEvent,
   AcpRuntimeHandle,
   AcpRuntimeStatus,
   AcpRuntimeTurnInput,
-  AcpRuntimeDoctorReport,
   PluginLogger,
 } from "openclaw/plugin-sdk";
 import { AcpRuntimeError } from "openclaw/plugin-sdk";
 import type { ResolvedStandardAcpConfig } from "./config.js";
 
 export const STANDARD_ACP_BACKEND_ID = "acp-standard";
+
+const REQUEST_TIMEOUT_MS = 120_000;
 
 type AgentProcess = {
   child: ChildProcess;
@@ -69,7 +71,10 @@ export class StandardAcpRuntime implements AcpRuntime {
         clientInfo: { name: "openclaw", version: "1.0.0" },
       });
 
-      const sessionResult = await this.sendRequest(agent, "session/new", {}) as Record<string, unknown>;
+      const sessionResult = (await this.sendRequest(agent, "session/new", {})) as Record<
+        string,
+        unknown
+      >;
       agent.sessionId = (sessionResult?.id as string) ?? key;
     }
 
@@ -96,6 +101,15 @@ export class StandardAcpRuntime implements AcpRuntime {
       resolveWait?.();
     };
 
+    // Push error event on unexpected process exit so the loop never hangs.
+    const onClose = () => {
+      if (!done) {
+        events.push({ type: "error", message: "agent process exited unexpectedly" });
+        resolveWait?.();
+      }
+    };
+    agent.child.on("close", onClose);
+
     const promptPromise = this.sendRequest(agent, "session/prompt", {
       sessionId: agent.sessionId,
       messages: [{ role: "user", content: { type: "text", text: input.text } }],
@@ -115,12 +129,15 @@ export class StandardAcpRuntime implements AcpRuntime {
             done = true;
           }
         } else {
-          await new Promise<void>((r) => { resolveWait = r; });
+          await new Promise<void>((r) => {
+            resolveWait = r;
+          });
         }
       }
       await promptPromise.catch(() => {});
     } finally {
       agent.notifications = null;
+      agent.child.removeListener("close", onClose);
       input.signal?.removeEventListener("abort", onAbort);
     }
   }
@@ -150,7 +167,11 @@ export class StandardAcpRuntime implements AcpRuntime {
       await this.probeAvailability();
       return this.healthy
         ? { ok: true, message: `${this.config.command} available` }
-        : { ok: false, code: "ACP_BACKEND_UNAVAILABLE", message: `${this.config.command} not responding` };
+        : {
+            ok: false,
+            code: "ACP_BACKEND_UNAVAILABLE",
+            message: `${this.config.command} not responding`,
+          };
     } catch (err) {
       return { ok: false, code: "ACP_BACKEND_UNAVAILABLE", message: String(err) };
     }
@@ -177,7 +198,7 @@ export class StandardAcpRuntime implements AcpRuntime {
     const child = spawn(this.config.command, this.config.args, {
       cwd: this.config.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...this.config.env },
+      env: this.config.env,
     });
 
     const agent: AgentProcess = {
@@ -238,9 +259,25 @@ export class StandardAcpRuntime implements AcpRuntime {
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
 
     return new Promise((resolve, reject) => {
-      agent.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        agent.pending.delete(id);
+        reject(new Error(`JSON-RPC request timed out: ${method}`));
+      }, REQUEST_TIMEOUT_MS);
+
+      agent.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+      });
+
       agent.child.stdin.write(msg + "\n", (err) => {
         if (err) {
+          clearTimeout(timer);
           agent.pending.delete(id);
           reject(err);
         }
