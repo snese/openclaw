@@ -78,15 +78,22 @@ export class StandardAcpRuntime implements AcpRuntime {
       agent = this.spawnAgent(key);
       this.agents.set(key, agent);
 
-      await this.sendRequest(agent, "initialize", {
-        clientInfo: { name: "openclaw", version: "1.0.0" },
-      });
+      try {
+        await this.sendRequest(agent, "initialize", {
+          clientInfo: { name: "openclaw", version: "1.0.0" },
+        });
 
-      const sessionResult = (await this.sendRequest(agent, "session/new", {
-        cwd: input.cwd ?? this.config.cwd,
-        mcpServers: [],
-      })) as Record<string, unknown>;
-      agent.sessionId = (sessionResult?.sessionId as string) ?? key;
+        const sessionResult = (await this.sendRequest(agent, "session/new", {
+          cwd: input.cwd ?? this.config.cwd,
+          mcpServers: [],
+        })) as Record<string, unknown>;
+        agent.sessionId = (sessionResult?.sessionId as string) ?? key;
+      } catch (err) {
+        // Clean up half-initialized agent so next call retries from scratch.
+        agent.child.kill("SIGTERM");
+        this.agents.delete(key);
+        throw err;
+      }
     }
 
     return {
@@ -186,7 +193,7 @@ export class StandardAcpRuntime implements AcpRuntime {
     if (!agent) return;
     await this.sendRequest(agent, "session/set_mode", {
       sessionId: agent.sessionId,
-      mode: input.mode,
+      modeId: input.mode,
     });
   }
 
@@ -242,6 +249,16 @@ export class StandardAcpRuntime implements AcpRuntime {
       pending: new Map(),
       notifications: null,
     };
+
+    // Handle spawn failures (e.g. ENOENT) without crashing the host process.
+    child.on("error", (err) => {
+      this.logger?.warn?.(`[acp-standard:${key}] spawn error: ${err.message}`);
+      for (const p of agent.pending.values()) {
+        p.reject(err);
+      }
+      agent.pending.clear();
+      this.agents.delete(key);
+    });
 
     const rl = createInterface({ input: stdout });
     rl.on("line", (line) => {
@@ -325,16 +342,27 @@ export class StandardAcpRuntime implements AcpRuntime {
   }
 
   private mapNotificationToEvent(params: Record<string, unknown>): AcpRuntimeEvent | null {
-    const type = params.type as string | undefined;
-    switch (type) {
-      case "AgentMessageChunk":
-        return { type: "text_delta", text: (params.delta as string) ?? "", stream: "output" };
-      case "ToolCall":
-        return { type: "tool_call", text: (params.name as string) ?? "tool" };
-      case "ToolCallUpdate":
-        return { type: "status", text: `tool: ${(params.name as string) ?? ""}` };
-      case "TurnEnd":
-        return { type: "done", stopReason: (params.stopReason as string) ?? "end_turn" };
+    // ACP session/update envelope: { update: { sessionUpdate: "...", ... } }
+    const update = params.update as Record<string, unknown> | undefined;
+    if (!update) return null;
+    const kind = update.sessionUpdate as string | undefined;
+
+    switch (kind) {
+      case "agent_message_chunk": {
+        const content = update.content as Record<string, unknown> | undefined;
+        return {
+          type: "text_delta",
+          text: (content?.text as string) ?? "",
+          stream: "output",
+        };
+      }
+      case "tool_call":
+        return { type: "tool_call", text: (update.title as string) ?? "tool" };
+      case "tool_call_update":
+        return {
+          type: "status",
+          text: `tool ${(update.toolCallId as string) ?? ""}: ${(update.status as string) ?? ""}`,
+        };
       default:
         return null;
     }
