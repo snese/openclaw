@@ -251,6 +251,8 @@ importers:
         specifier: ^0.10.0
         version: 0.10.0
 
+  extensions/acp-standard: {}
+
   extensions/acpx:
     dependencies:
       acpx:
