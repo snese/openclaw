@@ -80,11 +80,11 @@ export class StandardAcpRuntime implements AcpRuntime {
         clientInfo: { name: "openclaw", version: "1.0.0" },
       });
 
-      const sessionResult = (await this.sendRequest(agent, "session/new", {})) as Record<
-        string,
-        unknown
-      >;
-      agent.sessionId = (sessionResult?.id as string) ?? key;
+      const sessionResult = (await this.sendRequest(agent, "session/new", {
+        cwd: input.cwd ?? this.config.cwd,
+        mcpServers: [],
+      })) as Record<string, unknown>;
+      agent.sessionId = (sessionResult?.sessionId as string) ?? key;
     }
 
     return {
@@ -121,8 +121,26 @@ export class StandardAcpRuntime implements AcpRuntime {
 
     const promptPromise = this.sendRequest(agent, "session/prompt", {
       sessionId: agent.sessionId,
-      messages: [{ role: "user", content: { type: "text", text: input.text } }],
+      prompt: [{ type: "text", text: input.text }],
     });
+
+    // When the prompt response arrives, treat it as turn completion
+    // (agents may resolve the prompt without sending a TurnEnd notification).
+    promptPromise
+      .then((result) => {
+        if (!done) {
+          const res = result as Record<string, unknown> | undefined;
+          const stopReason = (res?.stopReason as string) ?? "end_turn";
+          events.push({ type: "done", stopReason });
+          resolveWait?.();
+        }
+      })
+      .catch((err) => {
+        if (!done) {
+          events.push({ type: "error", message: String(err) });
+          resolveWait?.();
+        }
+      });
 
     const onAbort = () => {
       void this.cancel({ handle: input.handle });
@@ -143,7 +161,6 @@ export class StandardAcpRuntime implements AcpRuntime {
           });
         }
       }
-      await promptPromise.catch(() => {});
     } finally {
       agent.notifications = null;
       agent.child.removeListener("close", onClose);
