@@ -16,7 +16,16 @@ import type { ResolvedStandardAcpConfig } from "./config.js";
 
 export const STANDARD_ACP_BACKEND_ID = "acp-standard";
 
-const REQUEST_TIMEOUT_MS = 120_000;
+/** Timeout for control-plane requests (initialize, session/new, etc.). */
+const CONTROL_TIMEOUT_MS = 30_000;
+
+/** Methods that are expected to return quickly. */
+const CONTROL_METHODS = new Set([
+  "initialize",
+  "session/new",
+  "session/cancel",
+  "session/set_mode",
+]);
 
 type AgentProcess = {
   child: ChildProcess;
@@ -198,7 +207,7 @@ export class StandardAcpRuntime implements AcpRuntime {
     const child = spawn(this.config.command, this.config.args, {
       cwd: this.config.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: this.config.env,
+      env: { ...process.env, ...this.config.env },
     });
 
     const agent: AgentProcess = {
@@ -257,27 +266,32 @@ export class StandardAcpRuntime implements AcpRuntime {
   private sendRequest(agent: AgentProcess, method: string, params: unknown): Promise<unknown> {
     const id = agent.nextId++;
     const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    const timeoutMs = CONTROL_METHODS.has(method) ? CONTROL_TIMEOUT_MS : undefined;
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        agent.pending.delete(id);
-        reject(new Error(`JSON-RPC request timed out: ${method}`));
-      }, REQUEST_TIMEOUT_MS);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      if (timeoutMs) {
+        timer = setTimeout(() => {
+          agent.pending.delete(id);
+          reject(new Error(`JSON-RPC request timed out: ${method}`));
+        }, timeoutMs);
+      }
 
       agent.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           resolve(v);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           reject(e);
         },
       });
 
       agent.child.stdin.write(msg + "\n", (err) => {
         if (err) {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           agent.pending.delete(id);
           reject(err);
         }
