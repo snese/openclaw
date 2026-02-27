@@ -1,39 +1,58 @@
 name: PR Review Notifier
 
 on:
-  pull_request_review_comment:
-    types: [created]
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
-  notify:
-    if: >
-      github.event.comment.user.login != 'snese' &&
-      github.event.pull_request.number == 28601
+  poll:
     runs-on: ubuntu-latest
     steps:
-      - name: Send Telegram notification
+      - name: Check for new review comments
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          AUTHOR="${{ github.event.comment.user.login }}"
-          URL="${{ github.event.comment.html_url }}"
-          # Truncate body to 500 chars for Telegram
-          BODY=$(echo '${{ toJSON(github.event.comment.body) }}' | python3 -c "
-          import sys,json
-          s=json.loads(sys.stdin.read())
-          # strip markdown badges
-          import re; s=re.sub(r'\*\*<sub>.*?</sub>\s*', '', s)
-          print(s[:500]+'...' if len(s)>500 else s)
-          ")
-          MSG="🔔 <b>PR #28601 review comment</b>
-          From: <code>${AUTHOR}</code>
-          ${BODY}
+          # Poll upstream PR for comments in the last 6 minutes (overlap for safety)
+          SINCE=$(date -u -d '6 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-6M +%Y-%m-%dT%H:%M:%SZ)
 
-          <a href=\"${URL}\">View comment</a>"
+          COMMENTS=$(curl -s \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/openclaw/openclaw/pulls/28601/comments?since=${SINCE}&sort=created&direction=desc&per_page=30")
 
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" \
-            -d parse_mode=HTML \
-            -d disable_web_page_preview=true \
-            --data-urlencode "text=${MSG}"
+          # Filter: not by snese, created after SINCE
+          echo "$COMMENTS" | python3 -c "
+          import json, sys, urllib.request, urllib.parse, os, re
+          comments = json.loads(sys.stdin.read())
+          if not isinstance(comments, list):
+              sys.exit(0)
+          bot_token = os.environ['BOT_TOKEN']
+          chat_id = os.environ['CHAT_ID']
+          since = '${SINCE}'
+          for c in comments:
+              if c['user']['login'] == 'snese':
+                  continue
+              if c['created_at'] < since:
+                  continue
+              author = c['user']['login']
+              url = c['html_url']
+              body = re.sub(r'\*\*<sub>.*?</sub>\s*', '', c['body'])
+              body = body[:400] + '...' if len(body) > 400 else body
+              # Escape HTML
+              body = body.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+              msg = f'🔔 <b>PR #28601 review</b>\nFrom: <code>{author}</code>\n{body}\n\n<a href=\"{url}\">View</a>'
+              data = urllib.parse.urlencode({
+                  'chat_id': chat_id,
+                  'parse_mode': 'HTML',
+                  'disable_web_page_preview': 'true',
+                  'text': msg
+              }).encode()
+              try:
+                  urllib.request.urlopen(f'https://api.telegram.org/bot{bot_token}/sendMessage', data)
+                  print(f'Notified: {author} @ {c[\"created_at\"]}')
+              except Exception as e:
+                  print(f'Failed: {e}')
+          "
