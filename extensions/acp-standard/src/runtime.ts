@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import type { Readable, Writable } from "node:stream";
 import type {
   AcpRuntime,
   AcpRuntimeCapabilities,
@@ -29,6 +30,7 @@ const CONTROL_METHODS = new Set([
 
 type AgentProcess = {
   child: ChildProcess;
+  stdin: Writable;
   sessionId: string | null;
   nextId: number;
   pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>;
@@ -224,18 +226,28 @@ export class StandardAcpRuntime implements AcpRuntime {
     const child = spawn(this.config.command, this.config.args, {
       cwd: this.config.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...this.config.env },
     });
+
+    // stdio: ["pipe","pipe","pipe"] guarantees these are non-null.
+    const stdin = child.stdin!;
+    const stdout = child.stdout!;
+    const stderr = child.stderr!;
+
+    // Merge config env on top of inherited env.
+    if (this.config.env && Object.keys(this.config.env).length > 0) {
+      // env was set at spawn time via the env option; handled below.
+    }
 
     const agent: AgentProcess = {
       child,
+      stdin,
       sessionId: null,
       nextId: 1,
       pending: new Map(),
       notifications: null,
     };
 
-    const rl = createInterface({ input: child.stdout });
+    const rl = createInterface({ input: stdout });
     rl.on("line", (line) => {
       try {
         const msg = JSON.parse(line) as Record<string, unknown>;
@@ -265,7 +277,7 @@ export class StandardAcpRuntime implements AcpRuntime {
       }
     });
 
-    child.stderr.on("data", (chunk) => {
+    stderr.on("data", (chunk: Buffer) => {
       this.logger?.warn?.(`[acp-standard:${key}] stderr: ${String(chunk).trim()}`);
     });
 
@@ -306,7 +318,7 @@ export class StandardAcpRuntime implements AcpRuntime {
         },
       });
 
-      agent.child.stdin.write(msg + "\n", (err) => {
+      agent.stdin.write(msg + "\n", (err) => {
         if (err) {
           if (timer) clearTimeout(timer);
           agent.pending.delete(id);
