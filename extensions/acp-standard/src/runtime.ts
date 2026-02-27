@@ -227,6 +227,14 @@ export class StandardAcpRuntime implements AcpRuntime {
     this.agents.delete(input.handle.sessionKey);
   }
 
+  /** Kill all spawned agent processes. Called during service shutdown. */
+  closeAll(): void {
+    for (const [key, agent] of this.agents) {
+      agent.child.kill("SIGTERM");
+      this.agents.delete(key);
+    }
+  }
+
   // --- JSON-RPC 2.0 transport ---
 
   private spawnAgent(key: string): AgentProcess {
