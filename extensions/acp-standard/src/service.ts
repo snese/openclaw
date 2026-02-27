@@ -10,6 +10,7 @@ import { STANDARD_ACP_BACKEND_ID, StandardAcpRuntime } from "./runtime.js";
 type StandardAcpRuntimeLike = AcpRuntime & {
   probeAvailability(): Promise<void>;
   isHealthy(): boolean;
+  closeAll(): void;
 };
 
 export function createStandardAcpService(params: {
@@ -51,6 +52,7 @@ export function createStandardAcpService(params: {
       })();
     },
     async stop(): Promise<void> {
+      runtime?.closeAll();
       unregisterAcpRuntimeBackend(STANDARD_ACP_BACKEND_ID);
       runtime = null;
     },
