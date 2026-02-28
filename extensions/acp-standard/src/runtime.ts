@@ -128,7 +128,8 @@ export class StandardAcpRuntime implements AcpRuntime {
   }
 
   private async initAgent(key: string, input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle> {
-    const agent = this.spawnAgent(key);
+    const effectiveCwd = input.cwd ?? this.config.cwd;
+    const agent = this.spawnAgent(key, effectiveCwd);
     this.agents.set(key, agent);
 
     try {
@@ -138,11 +139,10 @@ export class StandardAcpRuntime implements AcpRuntime {
       });
 
       const sessionResult = (await this.sendRequest(agent, "session/new", {
-        cwd: input.cwd ?? this.config.cwd,
+        cwd: effectiveCwd,
         mcpServers: [],
       })) as Record<string, unknown>;
       agent.sessionId = (sessionResult?.sessionId as string) ?? key;
-      agent.cwd = input.cwd ?? this.config.cwd;
     } catch (err) {
       agent.child.kill("SIGTERM");
       this.agents.delete(key);
@@ -153,7 +153,7 @@ export class StandardAcpRuntime implements AcpRuntime {
       sessionKey: key,
       backend: STANDARD_ACP_BACKEND_ID,
       runtimeSessionName: agent.sessionId ?? key,
-      cwd: input.cwd ?? this.config.cwd,
+      cwd: effectiveCwd,
     };
   }
 
@@ -303,10 +303,10 @@ export class StandardAcpRuntime implements AcpRuntime {
 
   // --- JSON-RPC 2.0 transport ---
 
-  private spawnAgent(key: string): AgentProcess {
+  private spawnAgent(key: string, cwd: string): AgentProcess {
     const resolved = this.resolveCommand(this.config.args);
     const child = spawn(resolved.command, resolved.args, {
-      cwd: this.config.cwd,
+      cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: this.spawnEnv,
       shell: resolved.shell,
@@ -321,7 +321,7 @@ export class StandardAcpRuntime implements AcpRuntime {
       child,
       stdin,
       sessionId: null,
-      cwd: this.config.cwd,
+      cwd,
       nextId: 1,
       pending: new Map(),
       notifications: null,
