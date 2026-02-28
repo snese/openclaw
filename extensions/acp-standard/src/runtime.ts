@@ -32,6 +32,7 @@ type AgentProcess = {
   child: ChildProcess;
   stdin: Writable;
   sessionId: string | null;
+  cwd: string;
   nextId: number;
   pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>;
   notifications: ((event: AcpRuntimeEvent) => void) | null;
@@ -85,12 +86,18 @@ export class StandardAcpRuntime implements AcpRuntime {
 
     if (this.agents.has(key)) {
       const agent = this.agents.get(key)!;
-      return {
-        sessionKey: key,
-        backend: STANDARD_ACP_BACKEND_ID,
-        runtimeSessionName: agent.sessionId ?? key,
-        cwd: input.cwd ?? this.config.cwd,
-      };
+      const effectiveCwd = input.cwd ?? this.config.cwd;
+      if (agent.cwd !== effectiveCwd) {
+        agent.child.kill("SIGTERM");
+        this.agents.delete(key);
+      } else {
+        return {
+          sessionKey: key,
+          backend: STANDARD_ACP_BACKEND_ID,
+          runtimeSessionName: agent.sessionId ?? key,
+          cwd: effectiveCwd,
+        };
+      }
     }
 
     const promise = this.initAgent(key, input);
@@ -117,6 +124,7 @@ export class StandardAcpRuntime implements AcpRuntime {
         mcpServers: [],
       })) as Record<string, unknown>;
       agent.sessionId = (sessionResult?.sessionId as string) ?? key;
+      agent.cwd = input.cwd ?? this.config.cwd;
     } catch (err) {
       agent.child.kill("SIGTERM");
       this.agents.delete(key);
@@ -162,7 +170,9 @@ export class StandardAcpRuntime implements AcpRuntime {
     agent.child.on("close", onClose);
 
     const onAbort = () => {
-      void this.cancel({ handle: input.handle });
+      this.cancel({ handle: input.handle }).catch((err) => {
+        this.logger?.warn?.(`[acp-standard] cancel failed during abort: ${err}`);
+      });
       // Force-terminate the turn so the iterator always unwinds.
       if (!done) {
         events.push({ type: "done", stopReason: "cancelled" });
@@ -255,7 +265,7 @@ export class StandardAcpRuntime implements AcpRuntime {
     if (!agent) return;
     await this.sendRequest(agent, "session/cancel", {
       sessionId: agent.sessionId,
-    }).catch(() => {});
+    });
   }
 
   async close(input: { handle: AcpRuntimeHandle; reason: string }): Promise<void> {
@@ -291,6 +301,7 @@ export class StandardAcpRuntime implements AcpRuntime {
       child,
       stdin,
       sessionId: null,
+      cwd: this.config.cwd,
       nextId: 1,
       pending: new Map(),
       notifications: null,
