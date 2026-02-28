@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import type { Writable } from "node:stream";
 import type {
@@ -60,12 +61,29 @@ export class StandardAcpRuntime implements AcpRuntime {
     return { ...process.env, ...this.config.env };
   }
 
+  /**
+   * Resolve command for cross-platform spawning.
+   * On Windows, .cmd/.bat shims (created by npm) need shell: true.
+   */
+  private resolveCommand(args: string[]): { command: string; args: string[]; shell?: boolean } {
+    if (process.platform !== "win32") {
+      return { command: this.config.command, args };
+    }
+    const ext = path.extname(this.config.command).toLowerCase();
+    if (ext === ".cmd" || ext === ".bat") {
+      return { command: this.config.command, args, shell: true };
+    }
+    return { command: this.config.command, args };
+  }
+
   async probeAvailability(): Promise<void> {
     try {
-      const child = spawn(this.config.command, ["--help"], {
+      const resolved = this.resolveCommand(["--help"]);
+      const child = spawn(resolved.command, resolved.args, {
         cwd: this.config.cwd,
         stdio: "ignore",
         env: this.spawnEnv,
+        shell: resolved.shell,
       });
       const code = await new Promise<number>((resolve) => {
         child.on("close", (c) => resolve(c ?? 1));
@@ -286,10 +304,12 @@ export class StandardAcpRuntime implements AcpRuntime {
   // --- JSON-RPC 2.0 transport ---
 
   private spawnAgent(key: string): AgentProcess {
-    const child = spawn(this.config.command, this.config.args, {
+    const resolved = this.resolveCommand(this.config.args);
+    const child = spawn(resolved.command, resolved.args, {
       cwd: this.config.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: this.spawnEnv,
+      shell: resolved.shell,
     });
 
     // stdio: ["pipe","pipe","pipe"] guarantees these are non-null.
