@@ -177,6 +177,32 @@ describe("StandardAcpRuntime", () => {
     runtime.closeAll();
   });
 
+  it("reinitializes agent when cwd changes", async () => {
+    await setup();
+    const runtime = makeRuntime();
+    const h1 = await runtime.ensureSession({
+      sessionKey: "s1",
+      agent: "mock",
+      mode: "persistent",
+      cwd: tmpDir,
+    });
+    const tmpDir2 = await mkdtemp(path.join(os.tmpdir(), "acp-test2-"));
+    try {
+      const h2 = await runtime.ensureSession({
+        sessionKey: "s1",
+        agent: "mock",
+        mode: "persistent",
+        cwd: tmpDir2,
+      });
+      expect(h2.cwd).toBe(tmpDir2);
+      // Fresh init produces a new session handle (old process was killed)
+      expect(h2.runtimeSessionName).toBe("mock-session-1");
+    } finally {
+      runtime.closeAll();
+      await rm(tmpDir2, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
   it("cleans up on initialization failure", async () => {
     await setup();
     const runtime = makeRuntime({ MOCK_FAIL_INIT: "1" });

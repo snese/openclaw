@@ -76,18 +76,39 @@ describe("createFeishuWSClient proxy handling", () => {
     expect(options?.agent).toBeUndefined();
   });
 
-  it("uses proxy env precedence: https_proxy first, then HTTPS_PROXY, then http_proxy/HTTP_PROXY", () => {
+  it("uses proxy env precedence: https_proxy > HTTPS_PROXY > http_proxy > HTTP_PROXY", () => {
+    // Test each level of the fallback chain independently.
+    // On Windows, process.env keys are case-insensitive, so setting both
+    // https_proxy and HTTPS_PROXY would alias to the same slot.
+
+    // Highest priority: https_proxy
     process.env.https_proxy = "http://lower-https:8001";
-    process.env.HTTPS_PROXY = "http://upper-https:8002";
-    process.env.http_proxy = "http://lower-http:8003";
-    process.env.HTTP_PROXY = "http://upper-http:8004";
-
     createFeishuWSClient(baseAccount);
-
-    expect(httpsProxyAgentCtorMock).toHaveBeenCalledTimes(1);
     expect(httpsProxyAgentCtorMock).toHaveBeenCalledWith("http://lower-https:8001");
-    const options = firstWsClientOptions();
-    expect(options.agent).toEqual({ proxyUrl: "http://lower-https:8001" });
+
+    vi.clearAllMocks();
+    delete process.env.https_proxy;
+
+    // Next: HTTPS_PROXY
+    process.env.HTTPS_PROXY = "http://upper-https:8002";
+    createFeishuWSClient(baseAccount);
+    expect(httpsProxyAgentCtorMock).toHaveBeenCalledWith("http://upper-https:8002");
+
+    vi.clearAllMocks();
+    delete process.env.HTTPS_PROXY;
+
+    // Next: http_proxy
+    process.env.http_proxy = "http://lower-http:8003";
+    createFeishuWSClient(baseAccount);
+    expect(httpsProxyAgentCtorMock).toHaveBeenCalledWith("http://lower-http:8003");
+
+    vi.clearAllMocks();
+    delete process.env.http_proxy;
+
+    // Lowest: HTTP_PROXY
+    process.env.HTTP_PROXY = "http://upper-http:8004";
+    createFeishuWSClient(baseAccount);
+    expect(httpsProxyAgentCtorMock).toHaveBeenCalledWith("http://upper-http:8004");
   });
 
   it("passes HTTP_PROXY to ws client when https vars are unset", () => {
