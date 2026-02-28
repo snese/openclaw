@@ -342,7 +342,21 @@ export class StandardAcpRuntime implements AcpRuntime {
       try {
         const msg = JSON.parse(line) as Record<string, unknown>;
 
+        // Distinguish responses (have result/error) from requests (have method).
         if ("id" in msg && msg.id != null) {
+          if ("method" in msg) {
+            // Agent-initiated request (e.g. requestPermission). We don't handle
+            // these yet — reply with a JSON-RPC "method not found" error so the
+            // agent doesn't stall waiting for a response.
+            const errorResponse = JSON.stringify({
+              jsonrpc: "2.0",
+              id: msg.id,
+              error: { code: -32601, message: "Method not supported by this client" },
+            });
+            agent.stdin.write(errorResponse + "\n");
+            return;
+          }
+
           const id = msg.id as number;
           const p = agent.pending.get(id);
           if (p) {
