@@ -8,6 +8,7 @@ import {
 } from "./bash-process-registry.js";
 import { createProcessSessionFixture } from "./bash-process-registry.test-helpers.js";
 import { createProcessTool } from "./bash-tools.process.js";
+import { processSchema } from "./bash-tools.schemas.js";
 
 afterEach(() => {
   resetProcessRegistryForTests();
@@ -30,12 +31,14 @@ async function pollSession(
   callId: string,
   sessionId: string,
   timeout?: number | string,
+  signal?: AbortSignal,
 ) {
-  return processTool.execute(callId, {
+  const args = {
     action: "poll",
     sessionId,
     ...(timeout === undefined ? {} : { timeout }),
-  });
+  } as unknown as Parameters<ReturnType<typeof createProcessTool>["execute"]>[1];
+  return processTool.execute(callId, args, signal);
 }
 
 function retryMs(result: Awaited<ReturnType<ReturnType<typeof createProcessTool>["execute"]>>) {
@@ -46,28 +49,33 @@ function pollStatus(result: Awaited<ReturnType<ReturnType<typeof createProcessTo
   return (result.details as { status?: string }).status;
 }
 
-test("process poll waits for completion when timeout is provided", async () => {
+async function expectCompletedPollWithTimeout(params: {
+  sessionId: string;
+  callId: string;
+  timeout: number | string;
+  advanceMs: number;
+  assertUnresolvedAtMs?: number;
+}) {
   vi.useFakeTimers();
   try {
-    const sessionId = "sess";
-    const { processTool, session } = createProcessSessionHarness(sessionId);
+    const { processTool, session } = createProcessSessionHarness(params.sessionId);
 
     setTimeout(() => {
       appendOutput(session, "stdout", "done\n");
       markExited(session, 0, null, "completed");
     }, 10);
 
-    const pollPromise = pollSession(processTool, "toolcall", sessionId, 2000);
+    const pollPromise = pollSession(processTool, params.callId, params.sessionId, params.timeout);
+    if (params.assertUnresolvedAtMs !== undefined) {
+      let resolved = false;
+      void pollPromise.finally(() => {
+        resolved = true;
+      });
+      await vi.advanceTimersByTimeAsync(params.assertUnresolvedAtMs);
+      expect(resolved).toBe(false);
+    }
 
-    let resolved = false;
-    void pollPromise.finally(() => {
-      resolved = true;
-    });
-
-    await vi.advanceTimersByTimeAsync(200);
-    expect(resolved).toBe(false);
-
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(params.advanceMs);
     const poll = await pollPromise;
     const details = poll.details as { status?: string; aggregated?: string };
     expect(details.status).toBe("completed");
@@ -75,24 +83,78 @@ test("process poll waits for completion when timeout is provided", async () => {
   } finally {
     vi.useRealTimers();
   }
+}
+
+test("process poll waits for completion when timeout is provided", async () => {
+  await expectCompletedPollWithTimeout({
+    sessionId: "sess",
+    callId: "toolcall",
+    timeout: 2000,
+    assertUnresolvedAtMs: 200,
+    advanceMs: 100,
+  });
 });
 
 test("process poll accepts string timeout values", async () => {
+  await expectCompletedPollWithTimeout({
+    sessionId: "sess-2",
+    callId: "toolcall",
+    timeout: "2000",
+    advanceMs: 350,
+  });
+});
+
+test("process poll clamps long waits to 30 seconds", async () => {
   vi.useFakeTimers();
   try {
-    const sessionId = "sess-2";
-    const { processTool, session } = createProcessSessionHarness(sessionId);
-    setTimeout(() => {
-      appendOutput(session, "stdout", "done\n");
-      markExited(session, 0, null, "completed");
-    }, 10);
+    const { processTool } = createProcessSessionHarness("sess-clamp");
 
-    const pollPromise = pollSession(processTool, "toolcall", sessionId, "2000");
-    await vi.advanceTimersByTimeAsync(350);
+    const pollPromise = pollSession(processTool, "toolcall", "sess-clamp", 120_000);
+    let resolved = false;
+    void pollPromise.finally(() => {
+      resolved = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(resolved).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
     const poll = await pollPromise;
-    const details = poll.details as { status?: string; aggregated?: string };
-    expect(details.status).toBe("completed");
-    expect(details.aggregated ?? "").toContain("done");
+    expect(pollStatus(poll)).toBe("running");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("process poll schema advertises the 30 second wait cap", () => {
+  const timeoutSchema = processSchema.properties.timeout;
+  expect((timeoutSchema as { description?: string }).description).toContain("max 30000 ms");
+});
+
+test("process poll aborts while waiting for completion", async () => {
+  vi.useFakeTimers();
+  try {
+    const { processTool } = createProcessSessionHarness("sess-abort");
+    const controller = new AbortController();
+
+    const pollPromise = pollSession(
+      processTool,
+      "toolcall",
+      "sess-abort",
+      30_000,
+      controller.signal,
+    );
+    await vi.advanceTimersByTimeAsync(500);
+    controller.abort();
+
+    let err: unknown;
+    try {
+      await pollPromise;
+    } catch (caught) {
+      err = caught;
+    }
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe("AbortError");
   } finally {
     vi.useRealTimers();
   }

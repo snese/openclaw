@@ -3,6 +3,7 @@ export type DraftStreamLoop = {
   flush: () => Promise<void>;
   stop: () => void;
   resetPending: () => void;
+  resetThrottleWindow: () => void;
   waitForInFlight: () => Promise<void>;
 };
 
@@ -10,6 +11,7 @@ export function createDraftStreamLoop(params: {
   throttleMs: number;
   isStopped: () => boolean;
   sendOrEditStreamMessage: (text: string) => Promise<void | boolean>;
+  onBackgroundFlushError?: (err: unknown) => void;
 }): DraftStreamLoop {
   let lastSentAt = 0;
   let pendingText = "";
@@ -32,13 +34,25 @@ export function createDraftStreamLoop(params: {
         return;
       }
       pendingText = "";
-      const current = params.sendOrEditStreamMessage(text).finally(() => {
-        if (inFlightPromise === current) {
-          inFlightPromise = undefined;
-        }
-      });
+      let current: Promise<void | boolean> | undefined;
+      try {
+        current = Promise.resolve(params.sendOrEditStreamMessage(text)).finally(() => {
+          if (inFlightPromise === current) {
+            inFlightPromise = undefined;
+          }
+        });
+      } catch (err) {
+        pendingText ||= text;
+        throw err;
+      }
       inFlightPromise = current;
-      const sent = await current;
+      let sent: void | boolean;
+      try {
+        sent = await current;
+      } catch (err) {
+        pendingText ||= text;
+        throw err;
+      }
       if (sent === false) {
         pendingText = text;
         return;
@@ -50,13 +64,23 @@ export function createDraftStreamLoop(params: {
     }
   };
 
+  const startBackgroundFlush = () => {
+    void flush().catch((err: unknown) => {
+      try {
+        params.onBackgroundFlushError?.(err);
+      } catch {
+        // Error reporting must not recreate the unhandled background rejection path.
+      }
+    });
+  };
+
   const schedule = () => {
     if (timer) {
       return;
     }
     const delay = Math.max(0, params.throttleMs - (Date.now() - lastSentAt));
     timer = setTimeout(() => {
-      void flush();
+      startBackgroundFlush();
     }, delay);
   };
 
@@ -71,7 +95,7 @@ export function createDraftStreamLoop(params: {
         return;
       }
       if (!timer && Date.now() - lastSentAt >= params.throttleMs) {
-        void flush();
+        startBackgroundFlush();
         return;
       }
       schedule();
@@ -86,6 +110,13 @@ export function createDraftStreamLoop(params: {
     },
     resetPending: () => {
       pendingText = "";
+    },
+    resetThrottleWindow: () => {
+      lastSentAt = 0;
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
     },
     waitForInFlight: async () => {
       if (inFlightPromise) {

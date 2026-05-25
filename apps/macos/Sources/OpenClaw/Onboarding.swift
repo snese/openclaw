@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import Observation
 import OpenClawChatUI
 import OpenClawDiscovery
@@ -10,17 +9,28 @@ enum UIStrings {
     static let welcomeTitle = "Welcome to OpenClaw"
 }
 
+enum RemoteOnboardingProbeState: Equatable {
+    case idle
+    case checking
+    case ok(RemoteGatewayProbeSuccess)
+    case failed(String)
+}
+
 @MainActor
 final class OnboardingController {
     static let shared = OnboardingController()
     private var window: NSWindow?
 
+    static func markComplete() {
+        UserDefaults.standard.set(true, forKey: onboardingSeenKey)
+        UserDefaults.standard.set(currentOnboardingVersion, forKey: onboardingVersionKey)
+        AppStateStore.shared.onboardingSeen = true
+    }
+
     func show() {
         if ProcessInfo.processInfo.isNixMode {
             // Nix mode is fully declarative; onboarding would suggest interactive setup that doesn't apply.
-            UserDefaults.standard.set(true, forKey: "openclaw.onboardingSeen")
-            UserDefaults.standard.set(currentOnboardingVersion, forKey: onboardingVersionKey)
-            AppStateStore.shared.onboardingSeen = true
+            Self.markComplete()
             return
         }
         if let window {
@@ -56,7 +66,6 @@ final class OnboardingController {
 }
 
 struct OnboardingView: View {
-    @Environment(\.openSettings) var openSettings
     @State var currentPage = 0
     @State var isRequesting = false
     @State var installingCLI = false
@@ -69,26 +78,13 @@ struct OnboardingView: View {
     @State var workspacePath: String = ""
     @State var workspaceStatus: String?
     @State var workspaceApplying = false
-    @State var anthropicAuthPKCE: AnthropicOAuth.PKCE?
-    @State var anthropicAuthCode: String = ""
-    @State var anthropicAuthStatus: String?
-    @State var anthropicAuthBusy = false
-    @State var anthropicAuthConnected = false
-    @State var anthropicAuthVerifying = false
-    @State var anthropicAuthVerified = false
-    @State var anthropicAuthVerificationAttempted = false
-    @State var anthropicAuthVerificationFailed = false
-    @State var anthropicAuthVerifiedAt: Date?
-    @State var anthropicAuthDetectedStatus: OpenClawOAuthStore.AnthropicOAuthStatus = .missingFile
-    @State var anthropicAuthAutoDetectClipboard = true
-    @State var anthropicAuthAutoConnectClipboard = true
-    @State var anthropicAuthLastPasteboardChangeCount = NSPasteboard.general.changeCount
-    @State var monitoringAuth = false
-    @State var authMonitorTask: Task<Void, Never>?
     @State var needsBootstrap = false
     @State var didAutoKickoff = false
     @State var showAdvancedConnection = false
     @State var preferredGatewayID: String?
+    @State var remoteProbeState: RemoteOnboardingProbeState = .idle
+    @State var remoteAuthIssue: RemoteGatewayAuthIssue?
+    @State var suppressRemoteProbeReset = false
     @State var gatewayDiscovery: GatewayDiscoveryModel
     @State var onboardingChatModel: OpenClawChatViewModel
     @State var onboardingSkillsModel = SkillsSettingsModel()
@@ -104,18 +100,8 @@ struct OnboardingView: View {
     let pageWidth: CGFloat = Self.windowWidth
     let contentHeight: CGFloat = 460
     let connectionPageIndex = 1
-    let anthropicAuthPageIndex = 2
     let wizardPageIndex = 3
     let onboardingChatPageIndex = 8
-
-    static let clipboardPoll: AnyPublisher<Date, Never> = {
-        if ProcessInfo.processInfo.isRunningTests {
-            return Empty(completeImmediately: false).eraseToAnyPublisher()
-        }
-        return Timer.publish(every: 0.4, on: .main, in: .common)
-            .autoconnect()
-            .eraseToAnyPublisher()
-    }()
 
     let permissionsPageIndex = 5
     static func pageOrder(

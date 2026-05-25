@@ -1,43 +1,81 @@
-import crypto from "node:crypto";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import { describeInterpreterInlineEval } from "../infra/command-analysis/inline-eval.js";
+import { detectPolicyInlineEval } from "../infra/command-analysis/policy.js";
 import {
-  addAllowlistEntry,
+  addDurableCommandApproval,
+  analyzeShellCommand,
   type ExecAsk,
+  resolveExecApprovalAllowedDecisions,
   type ExecSecurity,
-  buildSafeBinsShellCommand,
-  buildSafeShellCommand,
+  buildEnforcedShellCommand,
   evaluateShellAllowlist,
-  maxAsk,
-  minSecurity,
-  recordAllowlistUse,
+  hasDurableExecApproval,
+  persistAllowAlwaysPatterns,
+  recordAllowlistMatchesUse,
+  resolveApprovalAuditTrustPath,
   requiresExecApproval,
-  resolveExecApprovals,
 } from "../infra/exec-approvals.js";
+import type { SafeBinProfile } from "../infra/exec-safe-bin-policy.js";
+import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../utils/message-channel.js";
 import { markBackgrounded, tail } from "./bash-process-registry.js";
-import { requestExecApprovalDecision } from "./bash-tools.exec-approval-request.js";
 import {
-  DEFAULT_APPROVAL_TIMEOUT_MS,
+  buildExecApprovalRequesterContext,
+  buildExecApprovalTurnSourceContext,
+  registerExecApprovalRequestForHostOrThrow,
+} from "./bash-tools.exec-approval-request.js";
+import {
+  buildDefaultExecApprovalRequestArgs,
+  buildHeadlessExecApprovalDeniedMessage,
+  buildExecApprovalFollowupTarget,
+  buildExecApprovalPendingToolResult,
+  createExecApprovalDecisionState,
+  createAndRegisterDefaultExecApprovalRequest,
+  enforceStrictInlineEvalApprovalBoundary,
+  resolveApprovalDecisionOrUndefined,
+  resolveExecHostApprovalContext,
+  sendExecApprovalFollowupResult,
+  shouldResolveExecApprovalUnavailableInline,
+} from "./bash-tools.exec-host-shared.js";
+import {
   DEFAULT_NOTIFY_TAIL_CHARS,
   createApprovalSlug,
-  emitExecSystemEvent,
   normalizeNotifyOutput,
   runExecProcess,
 } from "./bash-tools.exec-runtime.js";
-import type { ExecToolDetails } from "./bash-tools.exec-types.js";
+import type {
+  ExecElevatedDefaults,
+  ExecApprovalFollowupFactory,
+  ExecApprovalFollowupOutcome,
+  ExecToolDetails,
+} from "./bash-tools.exec-types.js";
 
 export type ProcessGatewayAllowlistParams = {
   command: string;
   workdir: string;
   env: Record<string, string>;
+  pathPrepend?: string[];
+  requestedEnv?: Record<string, string>;
   pty: boolean;
   timeoutSec?: number;
   defaultTimeoutSec: number;
   security: ExecSecurity;
   ask: ExecAsk;
   safeBins: Set<string>;
+  safeBinProfiles: Readonly<Record<string, SafeBinProfile>>;
+  strictInlineEval?: boolean;
+  commandHighlighting?: boolean;
+  trigger?: string;
   agentId?: string;
   sessionKey?: string;
+  bashElevated?: ExecElevatedDefaults;
+  turnSourceChannel?: string;
+  turnSourceTo?: string;
+  turnSourceAccountId?: string;
+  turnSourceThreadId?: string | number;
   scopeKey?: string;
+  approvalFollowupText?: string;
+  approvalFollowup?: ExecApprovalFollowupFactory;
+  approvalFollowupMode?: "agent" | "direct";
   warnings: string[];
   notifySessionKey?: string;
   approvalRunningNoticeMs: number;
@@ -48,26 +86,336 @@ export type ProcessGatewayAllowlistParams = {
 
 export type ProcessGatewayAllowlistResult = {
   execCommandOverride?: string;
+  allowWithoutEnforcedCommand?: boolean;
   pendingResult?: AgentToolResult<ExecToolDetails>;
+  deniedResult?: AgentToolResult<ExecToolDetails>;
 };
+
+function hasGatewayAllowlistMiss(params: {
+  hostSecurity: ExecSecurity;
+  analysisOk: boolean;
+  allowlistSatisfied: boolean;
+  durableApprovalSatisfied: boolean;
+}): boolean {
+  return (
+    params.hostSecurity === "allowlist" &&
+    (!params.analysisOk || !params.allowlistSatisfied) &&
+    !params.durableApprovalSatisfied
+  );
+}
+
+function normalizeCommandName(value: string | undefined): string {
+  return (value ?? "").split(/[\\/]/).pop()?.toLowerCase() ?? "";
+}
+
+function textMentionsSecurityAuditSuppressions(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return (
+    normalized.includes("security.audit.suppressions") ||
+    /["']?security["']?[\s\S]{0,200}["']?audit["']?[\s\S]{0,200}["']?suppressions["']?/.test(
+      normalized,
+    )
+  );
+}
+
+function isReadOnlySecurityAuditSuppressionInspection(argv: string[]): boolean {
+  const command = normalizeCommandName(argv[0]);
+  let offset = command === "pnpm" && argv[1] === "openclaw" ? 1 : 0;
+  if (normalizeCommandName(argv[offset]) !== "openclaw") {
+    return false;
+  }
+  offset += 1;
+  while (offset < argv.length) {
+    const arg = argv[offset];
+    if (["--dev", "--no-color"].includes(arg ?? "")) {
+      offset += 1;
+      continue;
+    }
+    if (["--profile", "--container", "--log-level"].includes(arg ?? "")) {
+      offset += 2;
+      continue;
+    }
+    if (
+      arg?.startsWith("--profile=") ||
+      arg?.startsWith("--container=") ||
+      arg?.startsWith("--log-level=")
+    ) {
+      offset += 1;
+      continue;
+    }
+    break;
+  }
+  return (
+    argv[offset] === "config" && ["get", "schema", "validate"].includes(argv[offset + 1] ?? "")
+  );
+}
+
+function removeParsedSegmentText(command: string, segments: Array<{ raw?: string }>): string {
+  let remaining = command;
+  for (const segment of segments) {
+    const raw = segment.raw?.trim();
+    if (!raw) {
+      continue;
+    }
+    remaining = remaining.replace(raw, " ");
+  }
+  return remaining;
+}
+
+function commandRequiresSecurityAuditSuppressionApproval(params: {
+  command: string;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+  segments: Array<{ argv: string[]; raw?: string }>;
+}): boolean {
+  let sawSegmentMention = false;
+  for (const segment of params.segments) {
+    const segmentText = `${segment.raw ?? ""} ${segment.argv.join(" ")}`;
+    if (!textMentionsSecurityAuditSuppressions(segmentText)) {
+      continue;
+    }
+    sawSegmentMention = true;
+    if (!isReadOnlySecurityAuditSuppressionInspection(segment.argv)) {
+      return true;
+    }
+  }
+  if (sawSegmentMention) {
+    const rawAnalysis = analyzeShellCommand({
+      command: params.command,
+      cwd: params.cwd,
+      env: params.env,
+      platform: process.platform,
+    });
+    if (!rawAnalysis.ok) {
+      return textMentionsSecurityAuditSuppressions(params.command);
+    }
+    for (const segment of rawAnalysis.segments) {
+      if (
+        textMentionsSecurityAuditSuppressions(`${segment.raw} ${segment.argv.join(" ")}`) &&
+        !isReadOnlySecurityAuditSuppressionInspection(segment.argv)
+      ) {
+        return true;
+      }
+    }
+    if (
+      textMentionsSecurityAuditSuppressions(
+        removeParsedSegmentText(params.command, rawAnalysis.segments),
+      )
+    ) {
+      return true;
+    }
+    return false;
+  }
+  return textMentionsSecurityAuditSuppressions(params.command);
+}
+
+function formatOutcomeExitLabel(outcome: { exitCode: number | null; timedOut: boolean }): string {
+  return outcome.timedOut ? "timeout" : `code ${outcome.exitCode ?? "?"}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function formatBytes(value: unknown): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return `${Math.max(0, Math.round(value))} bytes`;
+}
+
+function formatDiagnosticsContents(manifest: Record<string, unknown>): string[] {
+  const contents = Array.isArray(manifest.contents) ? manifest.contents : [];
+  if (contents.length === 0) {
+    return [];
+  }
+  const lines = [`Contents (${contents.length} files):`];
+  for (const entry of contents.slice(0, 12)) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const path = typeof entry.path === "string" ? entry.path : "";
+    if (!path) {
+      continue;
+    }
+    const bytes = formatBytes(entry.bytes);
+    lines.push(`- ${bytes ? `${path} (${bytes})` : path}`);
+  }
+  if (contents.length > 12) {
+    lines.push(`- ... ${contents.length - 12} more`);
+  }
+  return lines;
+}
+
+function formatDiagnosticsPrivacy(manifest: Record<string, unknown>): string[] {
+  const privacy = isRecord(manifest.privacy) ? manifest.privacy : null;
+  if (!privacy) {
+    return [];
+  }
+  const lines = ["Privacy:"];
+  if (typeof privacy.payloadFree === "boolean") {
+    lines.push(`- payload-free: ${privacy.payloadFree ? "yes" : "no"}`);
+  }
+  if (typeof privacy.rawLogsIncluded === "boolean") {
+    lines.push(`- raw logs included: ${privacy.rawLogsIncluded ? "yes" : "no"}`);
+  }
+  const notes = Array.isArray(privacy.notes)
+    ? privacy.notes.filter((note): note is string => typeof note === "string")
+    : [];
+  for (const note of notes.slice(0, 4)) {
+    lines.push(`- ${note}`);
+  }
+  return lines.length > 1 ? lines : [];
+}
+
+function formatDiagnosticsExportSuccess(aggregated: string): string {
+  const trimmed = aggregated.trim();
+  if (!trimmed) {
+    return "Diagnostics export completed, but no JSON output was returned.";
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!isRecord(parsed)) {
+      return trimmed;
+    }
+    const manifest = isRecord(parsed.manifest) ? parsed.manifest : {};
+    const lines = ["Diagnostics export created.", "", "Local Gateway bundle:"];
+    const bundlePath = typeof parsed.path === "string" ? parsed.path : "";
+    if (bundlePath) {
+      lines.push(`Path: ${bundlePath}`);
+    }
+    const bytes = formatBytes(parsed.bytes);
+    if (bytes) {
+      lines.push(`Size: ${bytes}`);
+    }
+    if (typeof manifest.generatedAt === "string") {
+      lines.push(`Generated at: ${manifest.generatedAt}`);
+    }
+    if (typeof manifest.openclawVersion === "string") {
+      lines.push(`OpenClaw version: ${manifest.openclawVersion}`);
+    }
+    const contents = formatDiagnosticsContents(manifest);
+    if (contents.length > 0) {
+      lines.push("", ...contents);
+    }
+    const privacy = formatDiagnosticsPrivacy(manifest);
+    if (privacy.length > 0) {
+      lines.push("", ...privacy);
+    }
+    return lines.join("\n");
+  } catch {
+    return trimmed;
+  }
+}
+
+function formatDiagnosticsExportFailure(params: {
+  outcome: { status: string; reason?: string; aggregated: string };
+  exitLabel: string;
+}): string {
+  const output = normalizeNotifyOutput(tail(params.outcome.aggregated || "", 4000));
+  const lines = [`Diagnostics export failed (${params.exitLabel}).`];
+  if (params.outcome.reason) {
+    lines.push(params.outcome.reason);
+  }
+  if (output) {
+    lines.push("", output);
+  }
+  return lines.join("\n");
+}
+
+function buildGatewayExecApprovalFollowupSummary(params: {
+  approvalId: string;
+  sessionId: string;
+  outcome: ExecApprovalFollowupOutcome;
+  trigger?: string;
+  approvalFollowupText?: string;
+}): string {
+  const exitLabel = formatOutcomeExitLabel(params.outcome);
+  if (params.trigger === "diagnostics") {
+    const diagnosticsText =
+      params.outcome.status === "completed" && params.outcome.exitCode === 0
+        ? formatDiagnosticsExportSuccess(params.outcome.aggregated)
+        : formatDiagnosticsExportFailure({ outcome: params.outcome, exitLabel });
+    const followupText = params.approvalFollowupText?.trim();
+    const body = [diagnosticsText, followupText].filter(Boolean).join("\n\n");
+    return `Exec finished (gateway id=${params.approvalId}, session=${params.sessionId}, ${exitLabel})\n${body}`;
+  }
+
+  const output = normalizeNotifyOutput(
+    tail(params.outcome.aggregated || "", DEFAULT_NOTIFY_TAIL_CHARS),
+  );
+  return output
+    ? `Exec finished (gateway id=${params.approvalId}, session=${params.sessionId}, ${exitLabel})\n${output}`
+    : `Exec finished (gateway id=${params.approvalId}, session=${params.sessionId}, ${exitLabel})`;
+}
+
+function shouldAwaitGatewayApprovalInline(params: {
+  turnSourceChannel?: string;
+  approvalFollowupMode?: "agent" | "direct";
+}): boolean {
+  if (params.approvalFollowupMode === "direct") {
+    return false;
+  }
+  return normalizeMessageChannel(params.turnSourceChannel) === INTERNAL_MESSAGE_CHANNEL;
+}
+
+function buildGatewayExecApprovalDeniedToolResult(params: {
+  approvalId: string;
+  deniedReason: string;
+  command: string;
+  cwd: string;
+}): AgentToolResult<ExecToolDetails> {
+  const text = `Exec denied (gateway id=${params.approvalId}, ${params.deniedReason}): ${params.command}`;
+  return {
+    content: [{ type: "text", text }],
+    details: {
+      status: "failed",
+      exitCode: null,
+      durationMs: 0,
+      aggregated: text,
+      timedOut: params.deniedReason.includes("timeout"),
+      cwd: params.cwd,
+    },
+  };
+}
+
+async function resolveGatewayExecApprovalFollowupText(params: {
+  approvalFollowup?: ExecApprovalFollowupFactory;
+  approvalId: string;
+  sessionId: string;
+  trigger?: string;
+  outcome: ExecApprovalFollowupOutcome;
+}): Promise<string | undefined> {
+  if (!params.approvalFollowup) {
+    return undefined;
+  }
+  try {
+    return await params.approvalFollowup({
+      approvalId: params.approvalId,
+      sessionId: params.sessionId,
+      trigger: params.trigger,
+      outcome: params.outcome,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `Diagnostics follow-up failed: ${message}`;
+  }
+}
 
 export async function processGatewayAllowlist(
   params: ProcessGatewayAllowlistParams,
 ): Promise<ProcessGatewayAllowlistResult> {
-  const approvals = resolveExecApprovals(params.agentId, {
+  const { approvals, hostSecurity, hostAsk, askFallback } = resolveExecHostApprovalContext({
+    agentId: params.agentId,
     security: params.security,
     ask: params.ask,
+    host: "gateway",
   });
-  const hostSecurity = minSecurity(params.security, approvals.agent.security);
-  const hostAsk = maxAsk(params.ask, approvals.agent.ask);
-  const askFallback = approvals.agent.askFallback;
-  if (hostSecurity === "deny") {
-    throw new Error("exec denied: host=gateway security=deny");
-  }
   const allowlistEval = evaluateShellAllowlist({
     command: params.command,
     allowlist: approvals.allowlist,
     safeBins: params.safeBins,
+    safeBinProfiles: params.safeBinProfiles,
     cwd: params.workdir,
     env: params.env,
     platform: process.platform,
@@ -77,118 +425,312 @@ export async function processGatewayAllowlist(
   const analysisOk = allowlistEval.analysisOk;
   const allowlistSatisfied =
     hostSecurity === "allowlist" && analysisOk ? allowlistEval.allowlistSatisfied : false;
-  const requiresAsk = requiresExecApproval({
-    ask: hostAsk,
-    security: hostSecurity,
+  const durableApprovalSatisfied = hasDurableExecApproval({
     analysisOk,
-    allowlistSatisfied,
+    segmentAllowlistEntries: allowlistEval.segmentAllowlistEntries,
+    allowlist: approvals.allowlist,
+    commandText: params.command,
   });
+  const inlineEvalHit =
+    params.strictInlineEval === true ? detectPolicyInlineEval(allowlistEval.segments) : null;
+  if (inlineEvalHit) {
+    params.warnings.push(
+      `Warning: strict inline-eval mode requires explicit approval for ${describeInterpreterInlineEval(
+        inlineEvalHit,
+      )}.`,
+    );
+  }
+  let enforcedCommand: string | undefined;
+  let allowlistPlanUnavailableReason: string | null = null;
+  if (hostSecurity === "allowlist" && analysisOk && allowlistSatisfied) {
+    const enforced = buildEnforcedShellCommand({
+      command: params.command,
+      segments: allowlistEval.segments,
+      platform: process.platform,
+    });
+    if (!enforced.ok || !enforced.command) {
+      allowlistPlanUnavailableReason = enforced.reason ?? "unsupported platform";
+    } else {
+      enforcedCommand = enforced.command;
+    }
+  }
+  const recordMatchedAllowlistUse = (resolvedPath?: string) =>
+    recordAllowlistMatchesUse({
+      approvals: approvals.file,
+      agentId: params.agentId,
+      matches: allowlistMatches,
+      command: params.command,
+      resolvedPath,
+    });
+  const hasHeredocSegment = allowlistEval.segments.some((segment) =>
+    segment.argv.some((token) => token.startsWith("<<")),
+  );
+  const requiresHeredocApproval =
+    hostSecurity === "allowlist" && analysisOk && allowlistSatisfied && hasHeredocSegment;
+  const requiresInlineEvalApproval = inlineEvalHit !== null;
+  const requiresAllowlistPlanApproval =
+    hostSecurity === "allowlist" &&
+    analysisOk &&
+    allowlistSatisfied &&
+    !enforcedCommand &&
+    allowlistPlanUnavailableReason !== null;
+  const requiresSecurityAuditSuppressionApproval =
+    commandRequiresSecurityAuditSuppressionApproval({
+      command: params.command,
+      cwd: params.workdir,
+      env: params.env,
+      segments: allowlistEval.segments,
+    }) && !(hostSecurity === "full" && hostAsk === "off");
+  const requiresAsk =
+    requiresExecApproval({
+      ask: hostAsk,
+      security: hostSecurity,
+      analysisOk,
+      allowlistSatisfied,
+      durableApprovalSatisfied,
+    }) ||
+    requiresAllowlistPlanApproval ||
+    requiresHeredocApproval ||
+    requiresInlineEvalApproval ||
+    requiresSecurityAuditSuppressionApproval;
+  if (requiresHeredocApproval) {
+    params.warnings.push(
+      "Warning: heredoc execution requires explicit approval in allowlist mode.",
+    );
+  }
+  if (requiresAllowlistPlanApproval) {
+    params.warnings.push(
+      `Warning: allowlist auto-execution is unavailable on ${process.platform}; explicit approval is required.`,
+    );
+  }
+  if (requiresSecurityAuditSuppressionApproval) {
+    params.warnings.push(
+      "Warning: security audit suppression changes require explicit approval unless exec is running in yolo mode.",
+    );
+  }
 
   if (requiresAsk) {
-    const approvalId = crypto.randomUUID();
-    const approvalSlug = createApprovalSlug(approvalId);
-    const expiresAtMs = Date.now() + DEFAULT_APPROVAL_TIMEOUT_MS;
-    const contextKey = `exec:${approvalId}`;
-    const resolvedPath = allowlistEval.segments[0]?.resolution?.resolvedPath;
-    const noticeSeconds = Math.max(1, Math.round(params.approvalRunningNoticeMs / 1000));
-    const effectiveTimeout =
-      typeof params.timeoutSec === "number" ? params.timeoutSec : params.defaultTimeoutSec;
-    const warningText = params.warnings.length ? `${params.warnings.join("\n")}\n\n` : "";
-
-    void (async () => {
-      let decision: string | null = null;
-      try {
-        decision = await requestExecApprovalDecision({
-          id: approvalId,
-          command: params.command,
-          cwd: params.workdir,
-          host: "gateway",
-          security: hostSecurity,
-          ask: hostAsk,
+    const requestArgs = buildDefaultExecApprovalRequestArgs({
+      warnings: params.warnings,
+      approvalRunningNoticeMs: params.approvalRunningNoticeMs,
+      createApprovalSlug,
+      turnSourceChannel: params.turnSourceChannel,
+      turnSourceAccountId: params.turnSourceAccountId,
+    });
+    const registerGatewayApproval = async (approvalId: string) =>
+      await registerExecApprovalRequestForHostOrThrow({
+        approvalId,
+        command: params.command,
+        env: params.requestedEnv,
+        workdir: params.workdir,
+        host: "gateway",
+        security: hostSecurity,
+        ask: hostAsk,
+        commandHighlighting: params.commandHighlighting,
+        warningText: params.warnings.join("\n").trim() || undefined,
+        ...buildExecApprovalRequesterContext({
           agentId: params.agentId,
-          resolvedPath,
           sessionKey: params.sessionKey,
-        });
-      } catch {
-        emitExecSystemEvent(
-          `Exec denied (gateway id=${approvalId}, approval-request-failed): ${params.command}`,
-          {
-            sessionKey: params.notifySessionKey,
-            contextKey,
-          },
+        }),
+        resolvedPath: resolveApprovalAuditTrustPath(
+          allowlistEval.segments[0]?.resolution ?? null,
+          params.workdir,
+        ),
+        ...buildExecApprovalTurnSourceContext(params),
+      });
+    const {
+      approvalId,
+      approvalSlug,
+      warningText,
+      expiresAtMs,
+      preResolvedDecision,
+      initiatingSurface,
+      sentApproverDms,
+      unavailableReason,
+    } = await createAndRegisterDefaultExecApprovalRequest({
+      ...requestArgs,
+      register: registerGatewayApproval,
+    });
+    if (
+      shouldResolveExecApprovalUnavailableInline({
+        trigger: params.trigger,
+        unavailableReason,
+        preResolvedDecision,
+      })
+    ) {
+      const { baseDecision, approvedByAsk, deniedReason } = createExecApprovalDecisionState({
+        decision: preResolvedDecision,
+        askFallback,
+      });
+      const strictInlineEvalDecision = enforceStrictInlineEvalApprovalBoundary({
+        baseDecision,
+        approvedByAsk,
+        deniedReason,
+        requiresInlineEvalApproval,
+      });
+
+      if (strictInlineEvalDecision.deniedReason || !strictInlineEvalDecision.approvedByAsk) {
+        throw new Error(
+          buildHeadlessExecApprovalDeniedMessage({
+            trigger: params.trigger,
+            host: "gateway",
+            security: hostSecurity,
+            ask: hostAsk,
+            askFallback,
+          }),
         );
-        return;
       }
 
-      let approvedByAsk = false;
-      let deniedReason: string | null = null;
+      recordMatchedAllowlistUse(
+        resolveApprovalAuditTrustPath(
+          allowlistEval.segments[0]?.resolution ?? null,
+          params.workdir,
+        ),
+      );
+      return {
+        execCommandOverride: enforcedCommand,
+        allowWithoutEnforcedCommand: enforcedCommand === undefined,
+      };
+    }
+    const resolvedPath = resolveApprovalAuditTrustPath(
+      allowlistEval.segments[0]?.resolution ?? null,
+      params.workdir,
+    );
+    const resolveApprovalForExecution = async (onFailure: () => void) => {
+      const decision = await resolveApprovalDecisionOrUndefined({
+        approvalId,
+        preResolvedDecision,
+        onFailure,
+      });
+      if (decision === undefined) {
+        return { deniedReason: "approval-request-failed", requestFailed: true };
+      }
 
-      if (decision === "deny") {
-        deniedReason = "user-denied";
-      } else if (!decision) {
-        if (askFallback === "full") {
-          approvedByAsk = true;
-        } else if (askFallback === "allowlist") {
-          if (!analysisOk || !allowlistSatisfied) {
-            deniedReason = "approval-timeout (allowlist-miss)";
-          } else {
-            approvedByAsk = true;
-          }
+      const {
+        baseDecision,
+        approvedByAsk: initialApprovedByAsk,
+        deniedReason: initialDeniedReason,
+      } = createExecApprovalDecisionState({
+        decision,
+        askFallback,
+      });
+      let approvedByAsk = initialApprovedByAsk;
+      let deniedReason = initialDeniedReason;
+
+      if (baseDecision.timedOut && askFallback === "allowlist") {
+        if (!analysisOk || !allowlistSatisfied) {
+          // Use a colon separator rather than nested parens so the
+          // `Exec denied (gateway id=..., <deniedReason>): cmd` wire format
+          // stays unambiguous for parsers that close on the first `):`.
+          deniedReason = "approval-timeout: allowlist-miss";
         } else {
-          deniedReason = "approval-timeout";
+          approvedByAsk = true;
         }
       } else if (decision === "allow-once") {
         approvedByAsk = true;
       } else if (decision === "allow-always") {
         approvedByAsk = true;
-        if (hostSecurity === "allowlist") {
-          for (const segment of allowlistEval.segments) {
-            const pattern = segment.resolution?.resolvedPath ?? "";
-            if (pattern) {
-              addAllowlistEntry(approvals.file, params.agentId, pattern);
-            }
+        if (!requiresInlineEvalApproval) {
+          const patterns = persistAllowAlwaysPatterns({
+            approvals: approvals.file,
+            agentId: params.agentId,
+            segments: allowlistEval.segments,
+            cwd: params.workdir,
+            env: params.env,
+            platform: process.platform,
+            strictInlineEval: params.strictInlineEval === true,
+          });
+          if (patterns.length === 0) {
+            addDurableCommandApproval(approvals.file, params.agentId, params.command);
           }
         }
       }
 
-      if (hostSecurity === "allowlist" && (!analysisOk || !allowlistSatisfied) && !approvedByAsk) {
+      ({ approvedByAsk, deniedReason } = enforceStrictInlineEvalApprovalBoundary({
+        baseDecision,
+        approvedByAsk,
+        deniedReason,
+        requiresInlineEvalApproval,
+      }));
+
+      if (
+        !approvedByAsk &&
+        hasGatewayAllowlistMiss({
+          hostSecurity,
+          analysisOk,
+          allowlistSatisfied,
+          durableApprovalSatisfied,
+        })
+      ) {
         deniedReason = deniedReason ?? "allowlist-miss";
       }
 
-      if (deniedReason) {
-        emitExecSystemEvent(
-          `Exec denied (gateway id=${approvalId}, ${deniedReason}): ${params.command}`,
-          {
-            sessionKey: params.notifySessionKey,
-            contextKey,
-          },
+      return { deniedReason, requestFailed: false };
+    };
+
+    if (unavailableReason === null && shouldAwaitGatewayApprovalInline(params)) {
+      const approvalDecision = await resolveApprovalForExecution(() => undefined);
+      if (approvalDecision.deniedReason) {
+        return {
+          deniedResult: buildGatewayExecApprovalDeniedToolResult({
+            approvalId,
+            deniedReason: approvalDecision.deniedReason,
+            command: params.command,
+            cwd: params.workdir,
+          }),
+        };
+      }
+
+      recordMatchedAllowlistUse(resolvedPath ?? undefined);
+      return {
+        execCommandOverride: enforcedCommand,
+        allowWithoutEnforcedCommand: enforcedCommand === undefined,
+      };
+    }
+
+    const effectiveTimeout =
+      typeof params.timeoutSec === "number" ? params.timeoutSec : params.defaultTimeoutSec;
+    const followupTarget = buildExecApprovalFollowupTarget({
+      approvalId,
+      sessionKey: params.notifySessionKey ?? params.sessionKey,
+      bashElevated: params.bashElevated,
+      turnSourceChannel: params.turnSourceChannel,
+      turnSourceTo: params.turnSourceTo,
+      turnSourceAccountId: params.turnSourceAccountId,
+      turnSourceThreadId: params.turnSourceThreadId,
+      direct: params.approvalFollowupMode === "direct",
+    });
+
+    void (async () => {
+      const approvalDecision = await resolveApprovalForExecution(
+        () =>
+          void sendExecApprovalFollowupResult(
+            followupTarget,
+            `Exec denied (gateway id=${approvalId}, approval-request-failed): ${params.command}`,
+          ),
+      );
+      if (approvalDecision.requestFailed) {
+        return;
+      }
+
+      if (approvalDecision.deniedReason) {
+        await sendExecApprovalFollowupResult(
+          followupTarget,
+          `Exec denied (gateway id=${approvalId}, ${approvalDecision.deniedReason}): ${params.command}`,
         );
         return;
       }
 
-      if (allowlistMatches.length > 0) {
-        const seen = new Set<string>();
-        for (const match of allowlistMatches) {
-          if (seen.has(match.pattern)) {
-            continue;
-          }
-          seen.add(match.pattern);
-          recordAllowlistUse(
-            approvals.file,
-            params.agentId,
-            match,
-            params.command,
-            resolvedPath ?? undefined,
-          );
-        }
-      }
+      recordMatchedAllowlistUse(resolvedPath ?? undefined);
 
       let run: Awaited<ReturnType<typeof runExecProcess>> | null = null;
       try {
         run = await runExecProcess({
           command: params.command,
+          execCommand: enforcedCommand,
           workdir: params.workdir,
           env: params.env,
+          pathPrepend: params.pathPrepend,
           sandbox: undefined,
           containerWorkdir: null,
           usePty: params.pty,
@@ -198,125 +740,72 @@ export async function processGatewayAllowlist(
           notifyOnExit: false,
           notifyOnExitEmptySuccess: false,
           scopeKey: params.scopeKey,
-          sessionKey: params.notifySessionKey,
+          sessionKey: params.notifySessionKey ?? params.sessionKey,
           timeoutSec: effectiveTimeout,
         });
       } catch {
-        emitExecSystemEvent(
+        await sendExecApprovalFollowupResult(
+          followupTarget,
           `Exec denied (gateway id=${approvalId}, spawn-failed): ${params.command}`,
-          {
-            sessionKey: params.notifySessionKey,
-            contextKey,
-          },
         );
         return;
       }
 
       markBackgrounded(run.session);
 
-      let runningTimer: NodeJS.Timeout | null = null;
-      if (params.approvalRunningNoticeMs > 0) {
-        runningTimer = setTimeout(() => {
-          emitExecSystemEvent(
-            `Exec running (gateway id=${approvalId}, session=${run?.session.id}, >${noticeSeconds}s): ${params.command}`,
-            { sessionKey: params.notifySessionKey, contextKey },
-          );
-        }, params.approvalRunningNoticeMs);
-      }
-
       const outcome = await run.promise;
-      if (runningTimer) {
-        clearTimeout(runningTimer);
-      }
-      const output = normalizeNotifyOutput(
-        tail(outcome.aggregated || "", DEFAULT_NOTIFY_TAIL_CHARS),
-      );
-      const exitLabel = outcome.timedOut ? "timeout" : `code ${outcome.exitCode ?? "?"}`;
-      const summary = output
-        ? `Exec finished (gateway id=${approvalId}, session=${run.session.id}, ${exitLabel})\n${output}`
-        : `Exec finished (gateway id=${approvalId}, session=${run.session.id}, ${exitLabel})`;
-      emitExecSystemEvent(summary, { sessionKey: params.notifySessionKey, contextKey });
+      const dynamicFollowupText = await resolveGatewayExecApprovalFollowupText({
+        approvalFollowup: params.approvalFollowup,
+        approvalId,
+        sessionId: run.session.id,
+        trigger: params.trigger,
+        outcome,
+      });
+      const approvalFollowupText = [params.approvalFollowupText, dynamicFollowupText]
+        .map((text) => text?.trim())
+        .filter(Boolean)
+        .join("\n\n");
+      const summary = buildGatewayExecApprovalFollowupSummary({
+        approvalId,
+        sessionId: run.session.id,
+        outcome,
+        trigger: params.trigger,
+        approvalFollowupText,
+      });
+      await sendExecApprovalFollowupResult(followupTarget, summary);
     })();
 
     return {
-      pendingResult: {
-        content: [
-          {
-            type: "text",
-            text:
-              `${warningText}Approval required (id ${approvalSlug}). ` +
-              "Approve to run; updates will arrive after completion.",
-          },
-        ],
-        details: {
-          status: "approval-pending",
-          approvalId,
-          approvalSlug,
-          expiresAtMs,
-          host: "gateway",
-          command: params.command,
-          cwd: params.workdir,
-        },
-      },
+      pendingResult: buildExecApprovalPendingToolResult({
+        host: "gateway",
+        command: params.command,
+        cwd: params.workdir,
+        warningText,
+        approvalId,
+        approvalSlug,
+        expiresAtMs,
+        initiatingSurface,
+        sentApproverDms,
+        unavailableReason,
+        allowedDecisions: resolveExecApprovalAllowedDecisions({ ask: hostAsk }),
+      }),
     };
   }
 
-  if (hostSecurity === "allowlist" && (!analysisOk || !allowlistSatisfied)) {
+  if (
+    hasGatewayAllowlistMiss({
+      hostSecurity,
+      analysisOk,
+      allowlistSatisfied,
+      durableApprovalSatisfied,
+    })
+  ) {
     throw new Error("exec denied: allowlist miss");
   }
 
-  let execCommandOverride: string | undefined;
-  // If allowlist uses safeBins, sanitize only those stdin-only segments:
-  // disable glob/var expansion by forcing argv tokens to be literal via single-quoting.
-  if (
-    hostSecurity === "allowlist" &&
-    analysisOk &&
-    allowlistSatisfied &&
-    allowlistEval.segmentSatisfiedBy.some((by) => by === "safeBins")
-  ) {
-    const safe = buildSafeBinsShellCommand({
-      command: params.command,
-      segments: allowlistEval.segments,
-      segmentSatisfiedBy: allowlistEval.segmentSatisfiedBy,
-      platform: process.platform,
-    });
-    if (!safe.ok || !safe.command) {
-      // Fallback: quote everything (safe, but may change glob behavior).
-      const fallback = buildSafeShellCommand({
-        command: params.command,
-        platform: process.platform,
-      });
-      if (!fallback.ok || !fallback.command) {
-        throw new Error(`exec denied: safeBins sanitize failed (${safe.reason ?? "unknown"})`);
-      }
-      params.warnings.push(
-        "Warning: safeBins hardening used fallback quoting due to parser mismatch.",
-      );
-      execCommandOverride = fallback.command;
-    } else {
-      params.warnings.push(
-        "Warning: safeBins hardening disabled glob/variable expansion for stdin-only segments.",
-      );
-      execCommandOverride = safe.command;
-    }
-  }
+  recordMatchedAllowlistUse(
+    resolveApprovalAuditTrustPath(allowlistEval.segments[0]?.resolution ?? null, params.workdir),
+  );
 
-  if (allowlistMatches.length > 0) {
-    const seen = new Set<string>();
-    for (const match of allowlistMatches) {
-      if (seen.has(match.pattern)) {
-        continue;
-      }
-      seen.add(match.pattern);
-      recordAllowlistUse(
-        approvals.file,
-        params.agentId,
-        match,
-        params.command,
-        allowlistEval.segments[0]?.resolution?.resolvedPath,
-      );
-    }
-  }
-
-  return { execCommandOverride };
+  return { execCommandOverride: enforcedCommand };
 }

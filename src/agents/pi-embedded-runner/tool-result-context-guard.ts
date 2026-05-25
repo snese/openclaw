@@ -1,17 +1,30 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ContextEngine, ContextEngineRuntimeContext } from "../../context-engine/types.js";
+import {
+  CONTEXT_LIMIT_TRUNCATION_NOTICE,
+  formatContextLimitTruncationNotice,
+} from "./context-truncation-notice.js";
+import { log } from "./logger.js";
+import { MidTurnPrecheckSignal, type MidTurnPrecheckRequest } from "./run/midturn-precheck.js";
+import { shouldPreemptivelyCompactBeforePrompt } from "./run/preemptive-compaction.js";
+import {
+  CHARS_PER_TOKEN_ESTIMATE,
+  TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE,
+  type MessageCharEstimateCache,
+  createMessageCharEstimateCache,
+  estimateContextChars,
+  estimateMessageCharsCached,
+  getToolResultText,
+  invalidateMessageCharsCacheEntry,
+  isToolResultMessage,
+} from "./tool-result-char-estimator.js";
 
-const CHARS_PER_TOKEN_ESTIMATE = 4;
-// Keep a conservative input budget to absorb tokenizer variance and provider framing overhead.
-const CONTEXT_INPUT_HEADROOM_RATIO = 0.75;
 const SINGLE_TOOL_RESULT_CONTEXT_SHARE = 0.5;
-const TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE = 2;
-const IMAGE_CHAR_ESTIMATE = 8_000;
+const PREEMPTIVE_OVERFLOW_RATIO = 0.9;
 
-export const CONTEXT_LIMIT_TRUNCATION_NOTICE = "[truncated: output exceeded context limit]";
-const CONTEXT_LIMIT_TRUNCATION_SUFFIX = `\n${CONTEXT_LIMIT_TRUNCATION_NOTICE}`;
-
-export const PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER =
-  "[compacted: tool output removed to free context]";
+export const PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE =
+  "Context overflow: estimated context size exceeds safe threshold during tool loop.";
+const TOOL_RESULT_ESTIMATE_TO_TEXT_RATIO = 4 / TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE;
 
 type GuardableTransformContext = (
   messages: AgentMessage[],
@@ -24,140 +37,17 @@ type GuardableAgentRecord = {
   transformContext?: GuardableTransformContext;
 };
 
-function isTextBlock(block: unknown): block is { type: "text"; text: string } {
-  return !!block && typeof block === "object" && (block as { type?: unknown }).type === "text";
-}
+type MidTurnPrecheckOptions = {
+  enabled?: boolean;
+  contextTokenBudget: number;
+  reserveTokens: () => number;
+  toolResultMaxChars?: number;
+  getSystemPrompt?: () => string | undefined;
+  getPrePromptMessageCount?: () => number;
+  onMidTurnPrecheck?: (request: MidTurnPrecheckRequest) => void;
+};
 
-function isImageBlock(block: unknown): boolean {
-  return !!block && typeof block === "object" && (block as { type?: unknown }).type === "image";
-}
-
-function estimateUnknownChars(value: unknown): number {
-  if (typeof value === "string") {
-    return value.length;
-  }
-  if (value === undefined) {
-    return 0;
-  }
-  try {
-    const serialized = JSON.stringify(value);
-    return typeof serialized === "string" ? serialized.length : 0;
-  } catch {
-    return 256;
-  }
-}
-
-function isToolResultMessage(msg: AgentMessage): boolean {
-  const role = (msg as { role?: unknown }).role;
-  const type = (msg as { type?: unknown }).type;
-  return role === "toolResult" || role === "tool" || type === "toolResult";
-}
-
-function getToolResultContent(msg: AgentMessage): unknown[] {
-  if (!isToolResultMessage(msg)) {
-    return [];
-  }
-  const content = (msg as { content?: unknown }).content;
-  if (typeof content === "string") {
-    return [{ type: "text", text: content }];
-  }
-  return Array.isArray(content) ? content : [];
-}
-
-function getToolResultText(msg: AgentMessage): string {
-  const content = getToolResultContent(msg);
-  const chunks: string[] = [];
-  for (const block of content) {
-    if (isTextBlock(block)) {
-      chunks.push(block.text);
-    }
-  }
-  return chunks.join("\n");
-}
-
-function estimateMessageChars(msg: AgentMessage): number {
-  if (!msg || typeof msg !== "object") {
-    return 0;
-  }
-
-  if (msg.role === "user") {
-    const content = msg.content;
-    if (typeof content === "string") {
-      return content.length;
-    }
-    let chars = 0;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (isTextBlock(block)) {
-          chars += block.text.length;
-        } else if (isImageBlock(block)) {
-          chars += IMAGE_CHAR_ESTIMATE;
-        } else {
-          chars += estimateUnknownChars(block);
-        }
-      }
-    }
-    return chars;
-  }
-
-  if (msg.role === "assistant") {
-    let chars = 0;
-    const content = (msg as { content?: unknown }).content;
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (!block || typeof block !== "object") {
-          continue;
-        }
-        const typed = block as {
-          type?: unknown;
-          text?: unknown;
-          thinking?: unknown;
-          arguments?: unknown;
-        };
-        if (typed.type === "text" && typeof typed.text === "string") {
-          chars += typed.text.length;
-        } else if (typed.type === "thinking" && typeof typed.thinking === "string") {
-          chars += typed.thinking.length;
-        } else if (typed.type === "toolCall") {
-          try {
-            chars += JSON.stringify(typed.arguments ?? {}).length;
-          } catch {
-            chars += 128;
-          }
-        } else {
-          chars += estimateUnknownChars(block);
-        }
-      }
-    }
-    return chars;
-  }
-
-  if (isToolResultMessage(msg)) {
-    let chars = 0;
-    const content = getToolResultContent(msg);
-    for (const block of content) {
-      if (isTextBlock(block)) {
-        chars += block.text.length;
-      } else if (isImageBlock(block)) {
-        chars += IMAGE_CHAR_ESTIMATE;
-      } else {
-        chars += estimateUnknownChars(block);
-      }
-    }
-    const details = (msg as { details?: unknown }).details;
-    chars += estimateUnknownChars(details);
-    const weightedChars = Math.ceil(
-      chars * (CHARS_PER_TOKEN_ESTIMATE / TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE),
-    );
-    return Math.max(chars, weightedChars);
-  }
-
-  return 256;
-}
-
-function estimateContextChars(messages: AgentMessage[]): number {
-  return messages.reduce((sum, msg) => sum + estimateMessageChars(msg), 0);
-}
+export { CONTEXT_LIMIT_TRUNCATION_NOTICE, formatContextLimitTruncationNotice };
 
 function truncateTextToBudget(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
@@ -165,21 +55,25 @@ function truncateTextToBudget(text: string, maxChars: number): string {
   }
 
   if (maxChars <= 0) {
-    return CONTEXT_LIMIT_TRUNCATION_NOTICE;
+    return formatContextLimitTruncationNotice(text.length);
   }
 
-  const bodyBudget = Math.max(0, maxChars - CONTEXT_LIMIT_TRUNCATION_SUFFIX.length);
-  if (bodyBudget <= 0) {
-    return CONTEXT_LIMIT_TRUNCATION_NOTICE;
+  let bodyBudget = maxChars;
+  for (let i = 0; i < 4; i += 1) {
+    const estimatedSuffix = formatContextLimitTruncationNotice(
+      Math.max(1, text.length - bodyBudget),
+    );
+    bodyBudget = Math.max(0, maxChars - estimatedSuffix.length);
   }
 
   let cutPoint = bodyBudget;
-  const newline = text.lastIndexOf("\n", bodyBudget);
+  const newline = text.lastIndexOf("\n", cutPoint);
   if (newline > bodyBudget * 0.7) {
     cutPoint = newline;
   }
 
-  return text.slice(0, cutPoint) + CONTEXT_LIMIT_TRUNCATION_SUFFIX;
+  const omittedChars = text.length - cutPoint;
+  return text.slice(0, cutPoint) + formatContextLimitTruncationNotice(omittedChars);
 }
 
 function replaceToolResultText(msg: AgentMessage, text: string): AgentMessage {
@@ -195,63 +89,82 @@ function replaceToolResultText(msg: AgentMessage, text: string): AgentMessage {
   } as AgentMessage;
 }
 
-function truncateToolResultToChars(msg: AgentMessage, maxChars: number): AgentMessage {
+function estimateBudgetToTextBudget(maxChars: number): number {
+  return Math.max(0, Math.floor(maxChars / TOOL_RESULT_ESTIMATE_TO_TEXT_RATIO));
+}
+
+function truncateToolResultToChars(
+  msg: AgentMessage,
+  maxChars: number,
+  cache: MessageCharEstimateCache,
+): AgentMessage {
   if (!isToolResultMessage(msg)) {
     return msg;
   }
 
-  const estimatedChars = estimateMessageChars(msg);
+  const estimatedChars = estimateMessageCharsCached(msg, cache);
   if (estimatedChars <= maxChars) {
     return msg;
   }
 
   const rawText = getToolResultText(msg);
   if (!rawText) {
-    return replaceToolResultText(msg, CONTEXT_LIMIT_TRUNCATION_NOTICE);
+    const omittedChars = Math.max(
+      1,
+      estimateBudgetToTextBudget(Math.max(estimatedChars - maxChars, 1)),
+    );
+    return replaceToolResultText(msg, formatContextLimitTruncationNotice(omittedChars));
   }
 
-  const truncatedText = truncateTextToBudget(rawText, maxChars);
+  const textBudget = estimateBudgetToTextBudget(maxChars);
+  if (textBudget <= 0) {
+    return replaceToolResultText(msg, formatContextLimitTruncationNotice(rawText.length));
+  }
+
+  if (rawText.length <= textBudget) {
+    return replaceToolResultText(msg, rawText);
+  }
+
+  const truncatedText = truncateTextToBudget(rawText, textBudget);
   return replaceToolResultText(msg, truncatedText);
 }
 
-function compactExistingToolResultsInPlace(params: {
-  messages: AgentMessage[];
-  charsNeeded: number;
-}): number {
-  const { messages, charsNeeded } = params;
-  if (charsNeeded <= 0) {
-    return 0;
-  }
-
-  let reduced = 0;
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!isToolResultMessage(msg)) {
-      continue;
-    }
-
-    const before = estimateMessageChars(msg);
-    if (before <= PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER.length) {
-      continue;
-    }
-
-    const compacted = replaceToolResultText(msg, PREEMPTIVE_TOOL_RESULT_COMPACTION_PLACEHOLDER);
-    applyMessageMutationInPlace(msg, compacted);
-    const after = estimateMessageChars(msg);
-    if (after >= before) {
-      continue;
-    }
-
-    reduced += before - after;
-    if (reduced >= charsNeeded) {
-      break;
-    }
-  }
-
-  return reduced;
+function cloneMessagesForGuard(messages: AgentMessage[]): AgentMessage[] {
+  return messages.map(
+    (msg) => ({ ...(msg as unknown as Record<string, unknown>) }) as unknown as AgentMessage,
+  );
 }
 
-function applyMessageMutationInPlace(target: AgentMessage, source: AgentMessage): void {
+function toolResultsNeedTruncation(params: {
+  messages: AgentMessage[];
+  maxSingleToolResultChars: number;
+}): boolean {
+  const { messages, maxSingleToolResultChars } = params;
+  const estimateCache = createMessageCharEstimateCache();
+  for (const message of messages) {
+    if (!isToolResultMessage(message)) {
+      continue;
+    }
+    if (estimateMessageCharsCached(message, estimateCache) > maxSingleToolResultChars) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function exceedsPreemptiveOverflowThreshold(params: {
+  messages: AgentMessage[];
+  maxContextChars: number;
+}): boolean {
+  const estimateCache = createMessageCharEstimateCache();
+  return estimateContextChars(params.messages, estimateCache) > params.maxContextChars;
+}
+
+function applyMessageMutationInPlace(
+  target: AgentMessage,
+  source: AgentMessage,
+  cache?: MessageCharEstimateCache,
+): void {
   if (target === source) {
     return;
   }
@@ -264,44 +177,193 @@ function applyMessageMutationInPlace(target: AgentMessage, source: AgentMessage)
     }
   }
   Object.assign(targetRecord, sourceRecord);
+  if (cache) {
+    invalidateMessageCharsCacheEntry(cache, target);
+  }
 }
 
-function enforceToolResultContextBudgetInPlace(params: {
+function enforceToolResultLimitInPlace(params: {
   messages: AgentMessage[];
-  contextBudgetChars: number;
   maxSingleToolResultChars: number;
 }): void {
-  const { messages, contextBudgetChars, maxSingleToolResultChars } = params;
+  const { messages, maxSingleToolResultChars } = params;
+  const estimateCache = createMessageCharEstimateCache();
 
-  // Ensure each tool result has an upper bound before considering total context usage.
   for (const message of messages) {
     if (!isToolResultMessage(message)) {
       continue;
     }
-    const truncated = truncateToolResultToChars(message, maxSingleToolResultChars);
-    applyMessageMutationInPlace(message, truncated);
+    const truncated = truncateToolResultToChars(message, maxSingleToolResultChars, estimateCache);
+    applyMessageMutationInPlace(message, truncated, estimateCache);
   }
+}
 
-  let currentChars = estimateContextChars(messages);
-  if (currentChars <= contextBudgetChars) {
-    return;
+function hasNewToolResultAfterFence(params: {
+  messages: AgentMessage[];
+  prePromptMessageCount: number;
+}): boolean {
+  for (const message of params.messages.slice(params.prePromptMessageCount)) {
+    if (isToolResultMessage(message)) {
+      return true;
+    }
   }
+  return false;
+}
 
-  // Compact oldest tool outputs first until the context is back under budget.
-  compactExistingToolResultsInPlace({
-    messages,
-    charsNeeded: currentChars - contextBudgetChars,
-  });
+function toMidTurnPrecheckRequest(
+  result: ReturnType<typeof shouldPreemptivelyCompactBeforePrompt>,
+): MidTurnPrecheckRequest | null {
+  if (result.route === "fits") {
+    return null;
+  }
+  return {
+    route: result.route,
+    estimatedPromptTokens: result.estimatedPromptTokens,
+    promptBudgetBeforeReserve: result.promptBudgetBeforeReserve,
+    overflowTokens: result.overflowTokens,
+    toolResultReducibleChars: result.toolResultReducibleChars,
+    effectiveReserveTokens: result.effectiveReserveTokens,
+  };
+}
+
+/**
+ * Per-iteration `afterTurn` + `assemble` wrapper for sessions where
+ * the context engine owns compaction. Lets the engine compact inside
+ * a long tool loop instead of only at end of attempt.
+ */
+export function installContextEngineLoopHook(params: {
+  agent: GuardableAgent;
+  contextEngine: ContextEngine;
+  sessionId: string;
+  sessionKey?: string;
+  sessionFile: string;
+  tokenBudget?: number;
+  modelId: string;
+  getPrePromptMessageCount?: () => number;
+  onAfterTurnCheckpoint?: (messageCount: number) => void;
+  getRuntimeContext?: (params: {
+    messages: AgentMessage[];
+    prePromptMessageCount: number;
+  }) => ContextEngineRuntimeContext | undefined;
+}): () => void {
+  const { contextEngine, sessionId, sessionKey, sessionFile, tokenBudget, modelId } = params;
+  const mutableAgent = params.agent as GuardableAgentRecord;
+  const originalTransformContext = mutableAgent.transformContext;
+  let lastSeenLength: number | null = null;
+  let lastAssembledView: AgentMessage[] | null = null;
+  let lastSourceMessages: AgentMessage[] | null = null;
+
+  mutableAgent.transformContext = (async (messages: AgentMessage[], signal: AbortSignal) => {
+    const transformed = originalTransformContext
+      ? await originalTransformContext.call(mutableAgent, messages, signal)
+      : messages;
+    const sourceMessages = Array.isArray(transformed) ? transformed : messages;
+    const checkedPrefixLength =
+      lastSeenLength == null ? 0 : Math.min(lastSeenLength, sourceMessages.length);
+    const sourceHistoryChanged =
+      lastSeenLength != null &&
+      lastSourceMessages != null &&
+      (sourceMessages.length < lastSeenLength ||
+        (sourceMessages.length === lastSeenLength &&
+          sourceMessages
+            .slice(0, checkedPrefixLength)
+            .some((message, index) => message !== lastSourceMessages?.[index])));
+    if (sourceHistoryChanged) {
+      lastSeenLength = null;
+      lastAssembledView = null;
+    }
+
+    // Seed the loop fence from the attempt's pre-prompt message count when available.
+    // This keeps the first real post-tool-call iteration eligible for compaction even
+    // if the hook's first observed call happens after tool results were appended.
+    const prePromptMessageCount = Math.max(
+      0,
+      Math.min(
+        sourceMessages.length,
+        lastSeenLength ?? params.getPrePromptMessageCount?.() ?? sourceMessages.length,
+      ),
+    );
+
+    const hasNewMessages = sourceMessages.length > prePromptMessageCount;
+    if (!hasNewMessages) {
+      lastSeenLength = prePromptMessageCount;
+      lastSourceMessages = sourceMessages;
+      return lastAssembledView ?? sourceMessages;
+    }
+    try {
+      if (typeof contextEngine.afterTurn === "function") {
+        await contextEngine.afterTurn({
+          sessionId,
+          sessionKey,
+          sessionFile,
+          messages: sourceMessages,
+          prePromptMessageCount,
+          tokenBudget,
+          runtimeContext: params.getRuntimeContext?.({
+            messages: sourceMessages,
+            prePromptMessageCount,
+          }),
+        });
+      } else {
+        const newMessages = sourceMessages.slice(prePromptMessageCount);
+        if (newMessages.length > 0) {
+          if (typeof contextEngine.ingestBatch === "function") {
+            await contextEngine.ingestBatch({
+              sessionId,
+              sessionKey,
+              messages: newMessages,
+            });
+          } else {
+            for (const message of newMessages) {
+              await contextEngine.ingest({
+                sessionId,
+                sessionKey,
+                message,
+              });
+            }
+          }
+        }
+      }
+      lastSeenLength = sourceMessages.length;
+      params.onAfterTurnCheckpoint?.(lastSeenLength);
+      lastSourceMessages = sourceMessages;
+      const assembled = await contextEngine.assemble({
+        sessionId,
+        sessionKey,
+        messages: sourceMessages,
+        tokenBudget,
+        model: modelId,
+      });
+      if (assembled && Array.isArray(assembled.messages) && assembled.messages !== sourceMessages) {
+        lastAssembledView = assembled.messages;
+        return assembled.messages;
+      }
+      lastAssembledView = null;
+    } catch {
+      // Best-effort: any engine failure falls through to the raw source
+      // messages so the tool loop still makes forward progress.
+      lastSeenLength = prePromptMessageCount;
+      lastAssembledView = null;
+      lastSourceMessages = sourceMessages;
+    }
+
+    return sourceMessages;
+  }) as GuardableTransformContext;
+
+  return () => {
+    mutableAgent.transformContext = originalTransformContext;
+  };
 }
 
 export function installToolResultContextGuard(params: {
   agent: GuardableAgent;
   contextWindowTokens: number;
+  midTurnPrecheck?: MidTurnPrecheckOptions;
 }): () => void {
   const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
-  const contextBudgetChars = Math.max(
+  const maxContextChars = Math.max(
     1_024,
-    Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * CONTEXT_INPUT_HEADROOM_RATIO),
+    Math.floor(contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE * PREEMPTIVE_OVERFLOW_RATIO),
   );
   const maxSingleToolResultChars = Math.max(
     1_024,
@@ -314,18 +376,78 @@ export function installToolResultContextGuard(params: {
   // narrow runtime view to keep callsites type-safe while preserving behavior.
   const mutableAgent = params.agent as GuardableAgentRecord;
   const originalTransformContext = mutableAgent.transformContext;
+  let lastSeenLength: number | null = null;
 
   mutableAgent.transformContext = (async (messages: AgentMessage[], signal: AbortSignal) => {
     const transformed = originalTransformContext
       ? await originalTransformContext.call(mutableAgent, messages, signal)
       : messages;
 
-    const contextMessages = Array.isArray(transformed) ? transformed : messages;
-    enforceToolResultContextBudgetInPlace({
-      messages: contextMessages,
-      contextBudgetChars,
+    const sourceMessages = Array.isArray(transformed) ? transformed : messages;
+    const contextMessages = toolResultsNeedTruncation({
+      messages: sourceMessages,
       maxSingleToolResultChars,
-    });
+    })
+      ? cloneMessagesForGuard(sourceMessages)
+      : sourceMessages;
+    if (contextMessages !== sourceMessages) {
+      enforceToolResultLimitInPlace({
+        messages: contextMessages,
+        maxSingleToolResultChars,
+      });
+    }
+    if (params.midTurnPrecheck?.enabled) {
+      const prePromptMessageCount = Math.max(
+        0,
+        Math.min(
+          contextMessages.length,
+          lastSeenLength ??
+            params.midTurnPrecheck.getPrePromptMessageCount?.() ??
+            contextMessages.length,
+        ),
+      );
+      lastSeenLength = prePromptMessageCount;
+      if (
+        hasNewToolResultAfterFence({
+          messages: contextMessages,
+          prePromptMessageCount,
+        })
+      ) {
+        // Use the same post-truncation view Pi will send to the next model call.
+        // Recovery re-applies truncation to the persisted session manager, so
+        // this precheck is only a routing signal, not the source of truth.
+        const precheck = shouldPreemptivelyCompactBeforePrompt({
+          messages: contextMessages,
+          systemPrompt: params.midTurnPrecheck.getSystemPrompt?.(),
+          // During a tool loop, the active user prompt is already part of messages.
+          prompt: "",
+          contextTokenBudget: params.midTurnPrecheck.contextTokenBudget,
+          reserveTokens: params.midTurnPrecheck.reserveTokens(),
+          toolResultMaxChars: params.midTurnPrecheck.toolResultMaxChars,
+        });
+        const request = toMidTurnPrecheckRequest(precheck);
+        log.debug(
+          `[context-overflow-midturn-precheck] tool-result-guard check route=${precheck.route} ` +
+            `messages=${contextMessages.length} prePromptMessageCount=${prePromptMessageCount} ` +
+            `estimatedPromptTokens=${precheck.estimatedPromptTokens} ` +
+            `promptBudgetBeforeReserve=${precheck.promptBudgetBeforeReserve} ` +
+            `overflowTokens=${precheck.overflowTokens}`,
+        );
+        if (request) {
+          params.midTurnPrecheck.onMidTurnPrecheck?.(request);
+          throw new MidTurnPrecheckSignal(request);
+        }
+      }
+      lastSeenLength = contextMessages.length;
+    }
+    if (
+      exceedsPreemptiveOverflowThreshold({
+        messages: contextMessages,
+        maxContextChars,
+      })
+    ) {
+      throw new Error(PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE);
+    }
 
     return contextMessages;
   }) as GuardableTransformContext;

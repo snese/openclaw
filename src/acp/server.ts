@@ -2,37 +2,35 @@
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
-import { loadConfig } from "../config/config.js";
-import { resolveGatewayAuth } from "../gateway/auth.js";
-import { buildGatewayConnectionDetails } from "../gateway/call.js";
+import { getRuntimeConfig } from "../config/config.js";
+import { resolveGatewayClientBootstrap } from "../gateway/client-bootstrap.js";
+import { startGatewayClientWhenEventLoopReady } from "../gateway/client-start-readiness.js";
 import { GatewayClient } from "../gateway/client.js";
+import {
+  GATEWAY_CLIENT_CAPS,
+  GATEWAY_CLIENT_MODES,
+  GATEWAY_CLIENT_NAMES,
+} from "../gateway/protocol/client-info.js";
 import { isMainModule } from "../infra/is-main.js";
-import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
+import { routeLogsToStderr } from "../logging/console.js";
+import { normalizeOptionalString } from "../shared/string-coerce.js";
+import { createFileAcpEventLedger, resolveDefaultAcpEventLedgerPath } from "./event-ledger.js";
 import { readSecretFromFile } from "./secret-file.js";
 import { AcpGatewayAgent } from "./translator.js";
-import type { AcpServerOptions } from "./types.js";
+import { normalizeAcpProvenanceMode, type AcpServerOptions } from "./types.js";
 
-export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
-  const cfg = loadConfig();
-  const connection = buildGatewayConnectionDetails({
+export async function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
+  routeLogsToStderr();
+  const cfg = getRuntimeConfig();
+  const bootstrap = await resolveGatewayClientBootstrap({
     config: cfg,
-    url: opts.gatewayUrl,
+    gatewayUrl: opts.gatewayUrl,
+    explicitAuth: {
+      token: opts.gatewayToken,
+      password: opts.gatewayPassword,
+    },
+    env: process.env,
   });
-
-  const isRemoteMode = cfg.gateway?.mode === "remote";
-  const remote = isRemoteMode ? cfg.gateway?.remote : undefined;
-  const auth = resolveGatewayAuth({ authConfig: cfg.gateway?.auth, env: process.env });
-
-  const token =
-    opts.gatewayToken ??
-    (isRemoteMode ? remote?.token?.trim() : undefined) ??
-    process.env.OPENCLAW_GATEWAY_TOKEN ??
-    auth.token;
-  const password =
-    opts.gatewayPassword ??
-    (isRemoteMode ? remote?.password?.trim() : undefined) ??
-    process.env.OPENCLAW_GATEWAY_PASSWORD ??
-    auth.password;
 
   let agent: AcpGatewayAgent | null = null;
   let onClosed!: () => void;
@@ -40,22 +38,52 @@ export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
     onClosed = resolve;
   });
   let stopped = false;
+  let onGatewayReadyResolve!: () => void;
+  let onGatewayReadyReject!: (err: Error) => void;
+  let gatewayReadySettled = false;
+  const gatewayReady = new Promise<void>((resolve, reject) => {
+    onGatewayReadyResolve = resolve;
+    onGatewayReadyReject = reject;
+  });
+  const resolveGatewayReady = () => {
+    if (gatewayReadySettled) {
+      return;
+    }
+    gatewayReadySettled = true;
+    onGatewayReadyResolve();
+  };
+  const rejectGatewayReady = (err: unknown) => {
+    if (gatewayReadySettled) {
+      return;
+    }
+    gatewayReadySettled = true;
+    onGatewayReadyReject(err instanceof Error ? err : new Error(String(err)));
+  };
 
   const gateway = new GatewayClient({
-    url: connection.url,
-    token: token || undefined,
-    password: password || undefined,
+    url: bootstrap.url,
+    token: bootstrap.auth.token,
+    password: bootstrap.auth.password,
+    preauthHandshakeTimeoutMs: bootstrap.preauthHandshakeTimeoutMs,
     clientName: GATEWAY_CLIENT_NAMES.CLI,
     clientDisplayName: "ACP",
     clientVersion: "acp",
     mode: GATEWAY_CLIENT_MODES.CLI,
+    caps: [GATEWAY_CLIENT_CAPS.TOOL_EVENTS],
     onEvent: (evt) => {
       void agent?.handleGatewayEvent(evt);
     },
     onHelloOk: () => {
+      resolveGatewayReady();
       agent?.handleGatewayReconnect();
     },
+    onConnectError: (err) => {
+      rejectGatewayReady(err);
+    },
     onClose: (code, reason) => {
+      if (!stopped) {
+        rejectGatewayReady(new Error(`gateway closed before ready (${code}): ${reason}`));
+      }
       agent?.handleGatewayDisconnect(`${code}: ${reason}`);
       // Resolve only on intentional shutdown (gateway.stop() sets closed
       // which skips scheduleReconnect, then fires onClose).  Transient
@@ -71,6 +99,7 @@ export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
       return;
     }
     stopped = true;
+    resolveGatewayReady();
     gateway.stop();
     // If no WebSocket is active (e.g. between reconnect attempts),
     // gateway.stop() won't trigger onClose, so resolve directly.
@@ -80,17 +109,34 @@ export function serveAcpGateway(opts: AcpServerOptions = {}): Promise<void> {
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 
+  // Start gateway first and wait for hello before accepting ACP requests.
+  const readiness = await startGatewayClientWhenEventLoopReady(gateway, {
+    clientOptions: { preauthHandshakeTimeoutMs: bootstrap.preauthHandshakeTimeoutMs },
+  });
+  if (!readiness.ready) {
+    rejectGatewayReady(new Error("gateway event loop readiness timeout"));
+  }
+  await gatewayReady.catch((err) => {
+    shutdown();
+    throw err;
+  });
+  if (stopped) {
+    return closed;
+  }
+
   const input = Writable.toWeb(process.stdout);
   const output = Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>;
   const stream = ndJsonStream(input, output);
+  const eventLedger = createFileAcpEventLedger({
+    filePath: resolveDefaultAcpEventLedgerPath(process.env),
+  });
 
-  new AgentSideConnection((conn: AgentSideConnection) => {
-    agent = new AcpGatewayAgent(conn, gateway, opts);
+  void new AgentSideConnection((conn: AgentSideConnection) => {
+    agent = new AcpGatewayAgent(conn, gateway, { ...opts, eventLedger });
     agent.start();
     return agent;
   }, stream);
 
-  gateway.start();
   return closed;
 }
 
@@ -147,6 +193,15 @@ function parseArgs(args: string[]): AcpServerOptions {
       opts.prefixCwd = false;
       continue;
     }
+    if (arg === "--provenance") {
+      const provenanceMode = normalizeAcpProvenanceMode(args[i + 1]);
+      if (!provenanceMode) {
+        throw new Error("Invalid --provenance value. Use off, meta, or meta+receipt.");
+      }
+      opts.provenanceMode = provenanceMode;
+      i += 1;
+      continue;
+    }
     if (arg === "--verbose" || arg === "-v") {
       opts.verbose = true;
       continue;
@@ -156,17 +211,21 @@ function parseArgs(args: string[]): AcpServerOptions {
       process.exit(0);
     }
   }
-  if (opts.gatewayToken?.trim() && tokenFile?.trim()) {
+  const gatewayToken = normalizeOptionalString(opts.gatewayToken);
+  const gatewayPassword = normalizeOptionalString(opts.gatewayPassword);
+  const normalizedTokenFile = normalizeOptionalString(tokenFile);
+  const normalizedPasswordFile = normalizeOptionalString(passwordFile);
+  if (gatewayToken && normalizedTokenFile) {
     throw new Error("Use either --token or --token-file.");
   }
-  if (opts.gatewayPassword?.trim() && passwordFile?.trim()) {
+  if (gatewayPassword && normalizedPasswordFile) {
     throw new Error("Use either --password or --password-file.");
   }
-  if (tokenFile?.trim()) {
-    opts.gatewayToken = readSecretFromFile(tokenFile, "Gateway token");
+  if (normalizedTokenFile) {
+    opts.gatewayToken = readSecretFromFile(normalizedTokenFile, "Gateway token");
   }
-  if (passwordFile?.trim()) {
-    opts.gatewayPassword = readSecretFromFile(passwordFile, "Gateway password");
+  if (normalizedPasswordFile) {
+    opts.gatewayPassword = readSecretFromFile(normalizedPasswordFile, "Gateway password");
   }
   return opts;
 }
@@ -187,6 +246,7 @@ Options:
   --require-existing      Fail if the session key/label does not exist
   --reset-session         Reset the session key before first use
   --no-prefix-cwd         Do not prefix prompts with the working directory
+  --provenance <mode>     ACP provenance mode: off, meta, or meta+receipt
   --verbose, -v           Verbose logging to stderr
   --help, -h              Show this help message
 `);

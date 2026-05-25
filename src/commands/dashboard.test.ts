@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   resolveGatewayPort: vi.fn(),
   resolveControlUiLinks: vi.fn(),
   copyToClipboard: vi.fn(),
+  ensureGatewayReadyForOperation: vi.fn(),
 }));
 
 vi.mock("../config/config.js", () => ({
@@ -23,6 +24,10 @@ vi.mock("./onboard-helpers.js", () => ({
 
 vi.mock("../infra/clipboard.js", () => ({
   copyToClipboard: mocks.copyToClipboard,
+}));
+
+vi.mock("./gateway-readiness.js", () => ({
+  ensureGatewayReadyForOperation: mocks.ensureGatewayReadyForOperation,
 }));
 
 const runtime = {
@@ -63,30 +68,26 @@ function mockSnapshot(params?: {
 
 describe("dashboardCommand bind selection", () => {
   beforeEach(() => {
-    mocks.readConfigFileSnapshot.mockReset();
-    mocks.resolveGatewayPort.mockReset();
-    mocks.resolveControlUiLinks.mockReset();
-    mocks.copyToClipboard.mockReset();
-    runtime.log.mockReset();
-    runtime.error.mockReset();
-    runtime.exit.mockReset();
-  });
-
-  it("maps lan bind to loopback for dashboard URLs", async () => {
-    mockSnapshot({ bind: "lan" });
-
-    await dashboardCommand(runtime, { noOpen: true });
-
-    expect(mocks.resolveControlUiLinks).toHaveBeenCalledWith({
-      port: 18789,
-      bind: "loopback",
-      customBindHost: undefined,
-      basePath: undefined,
+    mocks.readConfigFileSnapshot.mockClear();
+    mocks.resolveGatewayPort.mockClear();
+    mocks.resolveControlUiLinks.mockClear();
+    mocks.copyToClipboard.mockClear();
+    mocks.ensureGatewayReadyForOperation.mockReset();
+    mocks.ensureGatewayReadyForOperation.mockResolvedValue({
+      ready: true,
+      status: {},
+      recovered: false,
     });
+    runtime.log.mockClear();
+    runtime.error.mockClear();
+    runtime.exit.mockClear();
   });
 
-  it("defaults to loopback when bind is unset", async () => {
-    mockSnapshot();
+  it.each([
+    { label: "maps lan bind to loopback", snapshot: { bind: "lan" as const } },
+    { label: "defaults unset bind to loopback", snapshot: undefined },
+  ])("$label for dashboard URLs", async ({ snapshot }) => {
+    mockSnapshot(snapshot);
 
     await dashboardCommand(runtime, { noOpen: true });
 
@@ -95,6 +96,7 @@ describe("dashboardCommand bind selection", () => {
       bind: "loopback",
       customBindHost: undefined,
       basePath: undefined,
+      tlsEnabled: false,
     });
   });
 
@@ -108,6 +110,7 @@ describe("dashboardCommand bind selection", () => {
       bind: "custom",
       customBindHost: "10.0.0.5",
       basePath: undefined,
+      tlsEnabled: false,
     });
   });
 
@@ -121,6 +124,7 @@ describe("dashboardCommand bind selection", () => {
       bind: "tailnet",
       customBindHost: undefined,
       basePath: undefined,
+      tlsEnabled: false,
     });
   });
 });

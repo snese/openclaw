@@ -1,13 +1,19 @@
-import type { OpenClawConfig } from "../config/config.js";
+import { formatPortRangeHint } from "../cli/error-format.js";
 import { resolveGatewayPort } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { isValidEnvSecretRefId, type SecretInput } from "../config/types.secrets.js";
 import {
+  maybeAddTailnetOriginToControlUiAllowedOrigins,
   TAILSCALE_DOCS_LINES,
   TAILSCALE_EXPOSURE_OPTIONS,
   TAILSCALE_MISSING_BIN_NOTE_LINES,
 } from "../gateway/gateway-config-prompts.shared.js";
 import { findTailscaleBinary } from "../infra/tailscale.js";
 import type { RuntimeEnv } from "../runtime.js";
+import { resolveDefaultSecretProviderAlias } from "../secrets/ref-contract.js";
 import { validateIPv4AddressInput } from "../shared/net/ipv4.js";
+import { normalizeOptionalString, readStringValue } from "../shared/string-coerce.js";
+import { normalizeStringEntries } from "../shared/string-normalization.js";
 import { note } from "../terminal/note.js";
 import { buildGatewayAuthConfig } from "./configure.gateway-auth.js";
 import { confirm, select, text } from "./configure.shared.js";
@@ -19,6 +25,15 @@ import {
 } from "./onboard-helpers.js";
 
 type GatewayAuthChoice = "token" | "password" | "trusted-proxy";
+type GatewayTokenInputMode = "plaintext" | "ref";
+
+function validateGatewayPortInput(value: unknown): string | undefined {
+  const port = Number(typeof value === "string" ? value.trim() : value);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    return formatPortRangeHint();
+  }
+  return undefined;
+}
 
 export async function promptGatewayConfig(
   cfg: OpenClawConfig,
@@ -32,11 +47,11 @@ export async function promptGatewayConfig(
     await text({
       message: "Gateway port",
       initialValue: String(resolveGatewayPort(cfg)),
-      validate: (value) => (Number.isFinite(Number(value)) ? undefined : "Invalid port"),
+      validate: validateGatewayPortInput,
     }),
     runtime,
   );
-  const port = Number.parseInt(String(portRaw), 10);
+  const port = Number.parseInt(portRaw, 10);
 
   let bind = guardCancel(
     await select({
@@ -82,14 +97,14 @@ export async function promptGatewayConfig(
       }),
       runtime,
     );
-    customBindHost = typeof input === "string" ? input : undefined;
+    customBindHost = readStringValue(input);
   }
 
   let authMode = guardCancel(
     await select({
-      message: "Gateway auth",
+      message: "Gateway access protection",
       options: [
-        { value: "token", label: "Token", hint: "Recommended default" },
+        { value: "token", label: "Token (recommended)", hint: "Recommended default" },
         { value: "password", label: "Password" },
         {
           value: "trusted-proxy",
@@ -111,8 +126,10 @@ export async function promptGatewayConfig(
   );
 
   // Detect Tailscale binary before proceeding with serve/funnel setup.
+  // Persist the path so getTailnetHostname can reuse it for origin injection.
+  let tailscaleBin: string | null = null;
   if (tailscaleMode !== "off") {
-    const tailscaleBin = await findTailscaleBinary();
+    tailscaleBin = await findTailscaleBinary();
     if (!tailscaleBin) {
       note(TAILSCALE_MISSING_BIN_NOTE_LINES.join("\n"), "Tailscale Warning");
     }
@@ -121,14 +138,12 @@ export async function promptGatewayConfig(
   let tailscaleResetOnExit = false;
   if (tailscaleMode !== "off") {
     note(TAILSCALE_DOCS_LINES.join("\n"), "Tailscale");
-    tailscaleResetOnExit = Boolean(
-      guardCancel(
-        await confirm({
-          message: "Reset Tailscale serve/funnel on exit?",
-          initialValue: false,
-        }),
-        runtime,
-      ),
+    tailscaleResetOnExit = guardCancel(
+      await confirm({
+        message: "Reset Tailscale serve/funnel on exit?",
+        initialValue: false,
+      }),
+      runtime,
     );
   }
 
@@ -142,10 +157,8 @@ export async function promptGatewayConfig(
     authMode = "password";
   }
 
-  if (authMode === "trusted-proxy" && bind === "loopback") {
-    note("Trusted proxy auth requires network bind. Adjusting bind to lan.", "Note");
-    bind = "lan";
-  }
+  // trusted-proxy + loopback is valid when the reverse proxy runs on the same
+  // host (e.g. cloudflared, nginx, Caddy). trustedProxies must include 127.0.0.1.
   if (authMode === "trusted-proxy" && tailscaleMode !== "off") {
     note(
       "Trusted proxy auth is incompatible with Tailscale serve/funnel. Disabling Tailscale.",
@@ -155,7 +168,8 @@ export async function promptGatewayConfig(
     tailscaleResetOnExit = false;
   }
 
-  let gatewayToken: string | undefined;
+  let gatewayToken: SecretInput | undefined;
+  let gatewayTokenForCalls: string | undefined;
   let gatewayPassword: string | undefined;
   let trustedProxyConfig:
     | { userHeader: string; requiredHeaders?: string[]; allowUsers?: string[] }
@@ -164,14 +178,65 @@ export async function promptGatewayConfig(
   let next = cfg;
 
   if (authMode === "token") {
-    const tokenInput = guardCancel(
-      await text({
-        message: "Gateway token (blank to generate)",
-        initialValue: randomToken(),
+    const tokenInputMode = guardCancel(
+      await select<GatewayTokenInputMode>({
+        message: "Gateway token source",
+        options: [
+          {
+            value: "plaintext",
+            label: "Generate/store plaintext token",
+            hint: "Default",
+          },
+          {
+            value: "ref",
+            label: "Use SecretRef",
+            hint: "Store an env-backed reference instead of plaintext",
+          },
+        ],
+        initialValue: "plaintext",
       }),
       runtime,
     );
-    gatewayToken = normalizeGatewayTokenInput(tokenInput) || randomToken();
+    if (tokenInputMode === "ref") {
+      const envVar = guardCancel(
+        await text({
+          message: "Gateway token env var",
+          initialValue: "OPENCLAW_GATEWAY_TOKEN",
+          placeholder: "OPENCLAW_GATEWAY_TOKEN",
+          validate: (value) => {
+            const candidate = normalizeOptionalString(value) ?? "";
+            if (!isValidEnvSecretRefId(candidate)) {
+              return "Use an env var name like OPENCLAW_GATEWAY_TOKEN.";
+            }
+            const resolved = process.env[candidate]?.trim();
+            if (!resolved) {
+              return `Environment variable "${candidate}" is missing or empty in this session.`;
+            }
+            return undefined;
+          },
+        }),
+        runtime,
+      );
+      const envVarName = normalizeOptionalString(envVar) ?? "";
+      gatewayToken = {
+        source: "env",
+        provider: resolveDefaultSecretProviderAlias(cfg, "env", {
+          preferFirstProviderForSource: true,
+        }),
+        id: envVarName,
+      };
+      note(`Validated ${envVarName}. OpenClaw will store a token SecretRef.`, "Gateway token");
+    } else {
+      const tokenInput = guardCancel(
+        await text({
+          message: "Gateway token (blank to generate)",
+          initialValue: randomToken(),
+        }),
+        runtime,
+      );
+      gatewayTokenForCalls = normalizeGatewayTokenInput(tokenInput) || randomToken();
+      gatewayToken = gatewayTokenForCalls;
+    }
   }
 
   if (authMode === "password") {
@@ -182,7 +247,7 @@ export async function promptGatewayConfig(
       }),
       runtime,
     );
-    gatewayPassword = String(password ?? "").trim();
+    gatewayPassword = normalizeOptionalString(password) ?? "";
   }
 
   if (authMode === "trusted-proxy") {
@@ -216,10 +281,7 @@ export async function promptGatewayConfig(
       runtime,
     );
     const requiredHeaders = requiredHeadersRaw
-      ? String(requiredHeadersRaw)
-          .split(",")
-          .map((h) => h.trim())
-          .filter(Boolean)
+      ? normalizeStringEntries(requiredHeadersRaw.split(","))
       : [];
 
     const allowUsersRaw = guardCancel(
@@ -229,19 +291,14 @@ export async function promptGatewayConfig(
       }),
       runtime,
     );
-    const allowUsers = allowUsersRaw
-      ? String(allowUsersRaw)
-          .split(",")
-          .map((u) => u.trim())
-          .filter(Boolean)
-      : [];
+    const allowUsers = allowUsersRaw ? normalizeStringEntries(allowUsersRaw.split(",")) : [];
 
     const trustedProxiesRaw = guardCancel(
       await text({
         message: "Trusted proxy IPs (comma-separated)",
         placeholder: "10.0.1.10,192.168.1.5",
         validate: (value) => {
-          if (!value || String(value).trim() === "") {
+          if (!normalizeOptionalString(value)) {
             return "At least one trusted proxy IP is required";
           }
           return undefined;
@@ -249,13 +306,10 @@ export async function promptGatewayConfig(
       }),
       runtime,
     );
-    trustedProxies = String(trustedProxiesRaw)
-      .split(",")
-      .map((ip) => ip.trim())
-      .filter(Boolean);
+    trustedProxies = normalizeStringEntries(trustedProxiesRaw.split(","));
 
     trustedProxyConfig = {
-      userHeader: String(userHeader).trim(),
+      userHeader: normalizeOptionalString(userHeader) ?? "",
       requiredHeaders: requiredHeaders.length > 0 ? requiredHeaders : undefined,
       allowUsers: allowUsers.length > 0 ? allowUsers : undefined,
     };
@@ -287,5 +341,11 @@ export async function promptGatewayConfig(
     },
   };
 
-  return { config: next, port, token: gatewayToken };
+  next = await maybeAddTailnetOriginToControlUiAllowedOrigins({
+    config: next,
+    tailscaleMode,
+    tailscaleBin,
+  });
+
+  return { config: next, port, token: gatewayTokenForCalls };
 }

@@ -1,11 +1,7 @@
-import type { ChannelDirectoryEntry } from "openclaw/plugin-sdk";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { ChannelDirectoryEntry } from "../runtime-api.js";
+import { searchGraphUsers } from "./graph-users.js";
 import {
-  escapeOData,
-  fetchGraphJson,
-  type GraphChannel,
-  type GraphGroup,
-  type GraphResponse,
-  type GraphUser,
   listChannelsForTeam,
   listTeamsByName,
   normalizeQuery,
@@ -24,22 +20,7 @@ export async function listMSTeamsDirectoryPeersLive(params: {
   const token = await resolveGraphToken(params.cfg);
   const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : 20;
 
-  let users: GraphUser[] = [];
-  if (query.includes("@")) {
-    const escaped = escapeOData(query);
-    const filter = `(mail eq '${escaped}' or userPrincipalName eq '${escaped}')`;
-    const path = `/users?$filter=${encodeURIComponent(filter)}&$select=id,displayName,mail,userPrincipalName`;
-    const res = await fetchGraphJson<GraphResponse<GraphUser>>({ token, path });
-    users = res.value ?? [];
-  } else {
-    const path = `/users?$search=${encodeURIComponent(`"displayName:${query}"`)}&$select=id,displayName,mail,userPrincipalName&$top=${limit}`;
-    const res = await fetchGraphJson<GraphResponse<GraphUser>>({
-      token,
-      path,
-      headers: { ConsistencyLevel: "eventual" },
-    });
-    users = res.value ?? [];
-  }
+  const users = await searchGraphUsers({ token, query, top: limit });
 
   return users
     .map((user) => {
@@ -106,7 +87,11 @@ export async function listMSTeamsDirectoryGroupsLive(params: {
       if (!name) {
         continue;
       }
-      if (!name.toLowerCase().includes(channelQuery.toLowerCase())) {
+      if (
+        !normalizeLowercaseStringOrEmpty(name).includes(
+          normalizeLowercaseStringOrEmpty(channelQuery),
+        )
+      ) {
         continue;
       }
       results.push({

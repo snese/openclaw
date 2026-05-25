@@ -665,6 +665,40 @@
     return div.innerHTML;
   }
 
+  function escapeHtmlAttr(text) {
+    return escapeHtml(text).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+  }
+
+  // Validate image fields before interpolating data URLs.
+  const SAFE_IMAGE_MIME_RE = /^image\/(png|jpeg|gif|webp|svg\+xml|bmp|tiff|avif)$/i;
+  const SAFE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+  function sanitizeImageMimeType(mimeType) {
+    if (typeof mimeType === "string" && SAFE_IMAGE_MIME_RE.test(mimeType)) {
+      return mimeType.toLowerCase();
+    }
+    return "application/octet-stream";
+  }
+
+  function sanitizeImageBase64(data) {
+    if (typeof data !== "string") {
+      return "";
+    }
+    const cleaned = data.replace(/\s+/g, "");
+    if (!cleaned || cleaned.length % 4 !== 0 || !SAFE_BASE64_RE.test(cleaned)) {
+      return "";
+    }
+    return cleaned;
+  }
+
+  function renderDataUrlImage(img, className) {
+    const mimeType = sanitizeImageMimeType(img?.mimeType);
+    const base64 = sanitizeImageBase64(img?.data);
+    if (!base64) {
+      return "";
+    }
+    return `<img src="data:${mimeType};base64,${base64}" class="${className}" />`;
+  }
   /**
    * Truncate string to maxLen chars, append "..." if truncated.
    */
@@ -722,13 +756,13 @@
               `<span class="tree-role-tool">${escapeHtml(formatToolCall(toolCall.name, toolCall.arguments))}</span>`
             );
           }
-          return labelHtml + `<span class="tree-role-tool">[${msg.toolName || "tool"}]</span>`;
+          return labelHtml + `<span class="tree-role-tool">[${escapeHtml(msg.toolName || "tool")}]</span>`;
         }
         if (msg.role === "bashExecution") {
           const cmd = truncate(normalize(msg.command || ""));
           return labelHtml + `<span class="tree-role-tool">[bash]:</span> ${escapeHtml(cmd)}`;
         }
-        return labelHtml + `<span class="tree-muted">[${msg.role}]</span>`;
+        return labelHtml + `<span class="tree-muted">[${escapeHtml(msg.role)}]</span>`;
       }
       case "compaction":
         return (
@@ -751,11 +785,11 @@
         );
       }
       case "model_change":
-        return labelHtml + `<span class="tree-muted">[model: ${entry.modelId}]</span>`;
+        return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.modelId)}]</span>`;
       case "thinking_level_change":
-        return labelHtml + `<span class="tree-muted">[thinking: ${entry.thinkingLevel}]</span>`;
+        return labelHtml + `<span class="tree-muted">[thinking: ${escapeHtml(entry.thinkingLevel)}]</span>`;
       default:
-        return labelHtml + `<span class="tree-muted">[${entry.type}]</span>`;
+        return labelHtml + `<span class="tree-muted">[${escapeHtml(entry.type)}]</span>`;
     }
   }
 
@@ -1028,9 +1062,7 @@
       }
       return (
         '<div class="tool-images">' +
-        images
-          .map((img) => `<img src="data:${img.mimeType};base64,${img.data}" class="tool-image" />`)
-          .join("") +
+        images.map((img) => renderDataUrlImage(img, "tool-image")).join("") +
         "</div>"
       );
     };
@@ -1277,7 +1309,7 @@
    * Render the copy-link button HTML for a message.
    */
   function renderCopyLinkButton(entryId) {
-    return `<button class="copy-link-btn" data-entry-id="${entryId}" title="Copy link to this message">
+    return `<button class="copy-link-btn" data-entry-id="${escapeHtmlAttr(entryId)}" title="Copy link to this message">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
             <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
@@ -1288,7 +1320,7 @@
   function renderEntry(entry) {
     const ts = formatTimestamp(entry.timestamp);
     const tsHtml = ts ? `<div class="message-timestamp">${ts}</div>` : "";
-    const entryId = `entry-${entry.id}`;
+    const entryId = `entry-${escapeHtmlAttr(entry.id)}`;
     const copyBtnHtml = renderCopyLinkButton(entry.id);
 
     if (entry.type === "message") {
@@ -1303,7 +1335,7 @@
           if (images.length > 0) {
             html += '<div class="message-images">';
             for (const img of images) {
-              html += `<img src="data:${img.mimeType};base64,${img.data}" class="message-image" />`;
+              html += renderDataUrlImage(img, "message-image");
             }
             html += "</div>";
           }
@@ -1522,7 +1554,7 @@
             </div>
             <div class="header-info">
               <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${header?.timestamp ? new Date(header.timestamp).toLocaleString() : "unknown"}</span></div>
-              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${globalStats.models.join(", ") || "unknown"}</span></div>
+              <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${escapeHtml(globalStats.models.join(", ") || "unknown")}</span></div>
               <div class="info-item"><span class="info-label">Messages:</span><span class="info-value">${msgParts.join(", ") || "0"}</span></div>
               <div class="info-item"><span class="info-label">Tool Calls:</span><span class="info-value">${globalStats.toolCalls}</span></div>
               <div class="info-item"><span class="info-label">Tokens:</span><span class="info-value">${tokenParts.join(" ") || "0"}</span></div>
@@ -1684,6 +1716,89 @@
     return text.replace(/<(?=[a-zA-Z/])/g, "&lt;");
   }
 
+  const INLINE_DATA_IMAGE_RE = /^data:image\/[a-z0-9.+-]+;base64,/i;
+
+  function normalizeMarkdownImageLabel(text) {
+    const trimmed = typeof text === "string" ? text.trim() : "";
+    return trimmed || "image";
+  }
+
+  function renderMarkdownImage(token) {
+    const label = normalizeMarkdownImageLabel(token?.text);
+    const href = typeof token?.href === "string" ? token.href.trim() : "";
+    if (!INLINE_DATA_IMAGE_RE.test(href)) {
+      return escapeHtml(label);
+    }
+    return `<img src="${escapeHtmlAttr(href)}" alt="${escapeHtmlAttr(label)}">`;
+  }
+
+  const SAFE_MARKDOWN_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:", "ftp:"]);
+
+  function decodeMarkdownHrefCodePoint(value, radix) {
+    const codePoint = Number.parseInt(value, radix);
+    if (
+      !Number.isFinite(codePoint) ||
+      codePoint < 0 ||
+      codePoint > 0x10ffff ||
+      (codePoint >= 0xd800 && codePoint <= 0xdfff)
+    ) {
+      return "";
+    }
+    return String.fromCodePoint(codePoint);
+  }
+
+  function decodeMarkdownHrefEntities(text) {
+    return text.replace(
+      /&(?:#(\d+)|#x([\da-f]+)|(colon|tab|newline));/gi,
+      (_match, decimal, hex, named) => {
+        if (decimal) {
+          return decodeMarkdownHrefCodePoint(decimal, 10);
+        }
+        if (hex) {
+          return decodeMarkdownHrefCodePoint(hex, 16);
+        }
+        if (named?.toLowerCase() === "tab") {
+          return "\t";
+        }
+        if (named?.toLowerCase() === "newline") {
+          return "\n";
+        }
+        return ":";
+      },
+    );
+  }
+
+  function getMarkdownHrefProtocol(href) {
+    const normalized = decodeMarkdownHrefEntities(href)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028\u2029\ufeff\s]+/g, "")
+      .trim();
+    const match = /^([a-z][a-z0-9+.-]*):/i.exec(normalized);
+    return match ? `${match[1].toLowerCase()}:` : null;
+  }
+
+  function isSafeMarkdownLinkHref(href) {
+    const trimmed = typeof href === "string" ? href.trim() : "";
+    if (!trimmed) {
+      return true;
+    }
+    const protocol = getMarkdownHrefProtocol(trimmed);
+    return protocol === null || SAFE_MARKDOWN_LINK_PROTOCOLS.has(protocol);
+  }
+
+  function renderMarkdownLink(token) {
+    const text = this.parser.parseInline(token.tokens);
+    const href = typeof token?.href === "string" ? token.href.trim() : "";
+    if (!isSafeMarkdownLinkHref(href)) {
+      return text;
+    }
+
+    let html = `<a href="${escapeHtmlAttr(href)}"`;
+    if (typeof token?.title === "string" && token.title) {
+      html += ` title="${escapeHtmlAttr(token.title)}"`;
+    }
+    return `${html}>${text}</a>`;
+  }
+
   // Configure marked with syntax highlighting and HTML escaping for text
   marked.use({
     breaks: true,
@@ -1717,6 +1832,16 @@
       // Inline code: escape HTML
       codespan(token) {
         return `<code>${escapeHtml(token.text)}</code>`;
+      },
+      // Raw HTML blocks/inline HTML: escape to prevent script execution.
+      html(token) {
+        return escapeHtml(token.text);
+      },
+      image(token) {
+        return renderMarkdownImage(token);
+      },
+      link(token) {
+        return renderMarkdownLink.call(this, token);
       },
     },
   });

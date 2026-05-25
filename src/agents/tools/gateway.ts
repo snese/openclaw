@@ -1,7 +1,18 @@
-import { loadConfig, resolveGatewayPort } from "../../config/config.js";
+import { getRuntimeConfig, resolveGatewayPort } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { callGateway } from "../../gateway/call.js";
-import { resolveLeastPrivilegeOperatorScopesForMethod } from "../../gateway/method-scopes.js";
-import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../../utils/message-channel.js";
+import { resolveGatewayCredentialsFromConfig, trimToUndefined } from "../../gateway/credentials.js";
+import {
+  resolveLeastPrivilegeOperatorScopesForMethod,
+  type OperatorScope,
+} from "../../gateway/method-scopes.js";
+import { getOperatorApprovalRuntimeToken } from "../../gateway/operator-approval-runtime-token.js";
+import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../../gateway/protocol/client-info.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "../../shared/string-coerce.js";
 import { readStringParam } from "./common.js";
 
 export const DEFAULT_GATEWAY_URL = "ws://127.0.0.1:18789";
@@ -11,6 +22,8 @@ export type GatewayCallOptions = {
   gatewayToken?: string;
   timeoutMs?: number;
 };
+
+type GatewayOverrideTarget = "local" | "remote";
 
 export function readGatewayCallOptions(params: Record<string, unknown>): GatewayCallOptions {
   return {
@@ -26,7 +39,7 @@ function canonicalizeToolGatewayWsUrl(raw: string): { origin: string; key: strin
   try {
     url = new URL(input);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatErrorMessage(error);
     throw new Error(`invalid gatewayUrl: ${input} (${message})`, { cause: error });
   }
 
@@ -46,14 +59,17 @@ function canonicalizeToolGatewayWsUrl(raw: string): { origin: string; key: strin
 
   const origin = url.origin;
   // Key: protocol + host only, lowercased. (host includes IPv6 brackets + port when present)
-  const key = `${url.protocol}//${url.host.toLowerCase()}`;
+  const key = `${url.protocol}//${normalizeLowercaseStringOrEmpty(url.host)}`;
   return { origin, key };
 }
 
-function validateGatewayUrlOverrideForAgentTools(urlOverride: string): string {
-  const cfg = loadConfig();
+function validateGatewayUrlOverrideForAgentTools(params: {
+  cfg: OpenClawConfig;
+  urlOverride: string;
+}): { url: string; target: GatewayOverrideTarget } {
+  const { cfg } = params;
   const port = resolveGatewayPort(cfg);
-  const allowed = new Set<string>([
+  const localAllowed = new Set<string>([
     `ws://127.0.0.1:${port}`,
     `wss://127.0.0.1:${port}`,
     `ws://localhost:${port}`,
@@ -62,55 +78,105 @@ function validateGatewayUrlOverrideForAgentTools(urlOverride: string): string {
     `wss://[::1]:${port}`,
   ]);
 
-  const remoteUrl =
-    typeof cfg.gateway?.remote?.url === "string" ? cfg.gateway.remote.url.trim() : "";
+  let remoteKey: string | undefined;
+  const remoteUrl = normalizeOptionalString(cfg.gateway?.remote?.url) ?? "";
   if (remoteUrl) {
     try {
       const remote = canonicalizeToolGatewayWsUrl(remoteUrl);
-      allowed.add(remote.key);
+      remoteKey = remote.key;
     } catch {
       // ignore: misconfigured remote url; tools should fall back to default resolution.
     }
   }
 
-  const parsed = canonicalizeToolGatewayWsUrl(urlOverride);
-  if (!allowed.has(parsed.key)) {
-    throw new Error(
-      [
-        "gatewayUrl override rejected.",
-        `Allowed: ws(s) loopback on port ${port} (127.0.0.1/localhost/[::1])`,
-        "Or: configure gateway.remote.url and omit gatewayUrl to use the configured remote gateway.",
-      ].join(" "),
-    );
+  const parsed = canonicalizeToolGatewayWsUrl(params.urlOverride);
+  if (localAllowed.has(parsed.key)) {
+    return { url: parsed.origin, target: "local" };
   }
-  return parsed.origin;
+  if (remoteKey && parsed.key === remoteKey) {
+    return { url: parsed.origin, target: "remote" };
+  }
+  throw new Error(
+    [
+      "gatewayUrl override rejected.",
+      `Allowed: ws(s) loopback on port ${port} (127.0.0.1/localhost/[::1])`,
+      "Or: configure gateway.remote.url and omit gatewayUrl to use the configured remote gateway.",
+    ].join(" "),
+  );
+}
+
+function resolveGatewayOverrideToken(params: {
+  cfg: OpenClawConfig;
+  target: GatewayOverrideTarget;
+  explicitToken?: string;
+}): string | undefined {
+  if (params.explicitToken) {
+    return params.explicitToken;
+  }
+  return resolveGatewayCredentialsFromConfig({
+    cfg: params.cfg,
+    env: process.env,
+    modeOverride: params.target,
+    remoteTokenFallback: params.target === "remote" ? "remote-only" : "remote-env-local",
+    remotePasswordFallback: params.target === "remote" ? "remote-only" : "remote-env-local",
+  }).token;
 }
 
 export function resolveGatewayOptions(opts?: GatewayCallOptions) {
-  // Prefer an explicit override; otherwise let callGateway choose based on config.
-  const url =
-    typeof opts?.gatewayUrl === "string" && opts.gatewayUrl.trim()
-      ? validateGatewayUrlOverrideForAgentTools(opts.gatewayUrl)
+  const cfg = getRuntimeConfig();
+  const validatedOverride =
+    trimToUndefined(opts?.gatewayUrl) !== undefined
+      ? validateGatewayUrlOverrideForAgentTools({
+          cfg,
+          urlOverride: String(opts?.gatewayUrl),
+        })
       : undefined;
-  const token =
-    typeof opts?.gatewayToken === "string" && opts.gatewayToken.trim()
-      ? opts.gatewayToken.trim()
-      : undefined;
+  const explicitToken = trimToUndefined(opts?.gatewayToken);
+  const token = validatedOverride
+    ? resolveGatewayOverrideToken({
+        cfg,
+        target: validatedOverride.target,
+        explicitToken,
+      })
+    : explicitToken;
   const timeoutMs =
     typeof opts?.timeoutMs === "number" && Number.isFinite(opts.timeoutMs)
       ? Math.max(1, Math.floor(opts.timeoutMs))
       : 30_000;
-  return { url, token, timeoutMs };
+  return { url: validatedOverride?.url, token, timeoutMs };
+}
+
+const APPROVAL_RUNTIME_METHODS = new Set<string>([
+  "exec.approval.request",
+  "exec.approval.waitDecision",
+  "plugin.approval.request",
+  "plugin.approval.waitDecision",
+]);
+
+function resolveApprovalRuntimeTokenForGatewayTool(params: {
+  method: string;
+  opts: GatewayCallOptions;
+}): string | undefined {
+  if (!APPROVAL_RUNTIME_METHODS.has(params.method)) {
+    return undefined;
+  }
+  if (trimToUndefined(params.opts.gatewayUrl) !== undefined) {
+    return undefined;
+  }
+  return getOperatorApprovalRuntimeToken();
 }
 
 export async function callGatewayTool<T = Record<string, unknown>>(
   method: string,
   opts: GatewayCallOptions,
   params?: unknown,
-  extra?: { expectFinal?: boolean },
+  extra?: { expectFinal?: boolean; scopes?: OperatorScope[] },
 ) {
   const gateway = resolveGatewayOptions(opts);
-  const scopes = resolveLeastPrivilegeOperatorScopesForMethod(method);
+  const scopes = Array.isArray(extra?.scopes)
+    ? extra.scopes
+    : resolveLeastPrivilegeOperatorScopesForMethod(method, params);
+  const approvalRuntimeToken = resolveApprovalRuntimeTokenForGatewayTool({ method, opts });
   return await callGateway<T>({
     url: gateway.url,
     token: gateway.token,
@@ -121,6 +187,7 @@ export async function callGatewayTool<T = Record<string, unknown>>(
     clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
     clientDisplayName: "agent",
     mode: GATEWAY_CLIENT_MODES.BACKEND,
+    ...(approvalRuntimeToken ? { approvalRuntimeToken } : {}),
     scopes,
   });
 }

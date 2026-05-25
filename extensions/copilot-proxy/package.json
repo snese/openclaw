@@ -1,11 +1,11 @@
 {
   "name": "@openclaw/copilot-proxy",
-  "version": "2026.2.20",
+  "version": "2026.5.24",
   "private": true,
   "description": "OpenClaw Copilot Proxy provider plugin",
   "type": "module",
   "devDependencies": {
-    "openclaw": "workspace:*"
+    "@openclaw/plugin-sdk": "workspace:*"
   },
   "openclaw": {
     "extensions": [

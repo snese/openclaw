@@ -1,34 +1,39 @@
-import type { OpenClawConfig } from "../config/config.js";
-import { ensurePluginAllowlisted } from "../config/plugins-allowlist.js";
+import { normalizeChatChannelId } from "../channels/ids.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { setPluginEnabledInConfig } from "./toggle-config.js";
 
 export type PluginEnableResult = {
   config: OpenClawConfig;
   enabled: boolean;
+  pluginId: string;
   reason?: string;
 };
 
-export function enablePluginInConfig(cfg: OpenClawConfig, pluginId: string): PluginEnableResult {
+export function enablePluginInConfig(
+  cfg: OpenClawConfig,
+  pluginId: string,
+  options: { updateChannelConfig?: boolean } = {},
+): PluginEnableResult {
+  const builtInChannelId = normalizeChatChannelId(pluginId);
+  const resolvedId = builtInChannelId ?? pluginId;
   if (cfg.plugins?.enabled === false) {
-    return { config: cfg, enabled: false, reason: "plugins disabled" };
+    return { config: cfg, enabled: false, pluginId: resolvedId, reason: "plugins disabled" };
   }
-  if (cfg.plugins?.deny?.includes(pluginId)) {
-    return { config: cfg, enabled: false, reason: "blocked by denylist" };
+  if (cfg.plugins?.deny?.includes(pluginId) || cfg.plugins?.deny?.includes(resolvedId)) {
+    return { config: cfg, enabled: false, pluginId: resolvedId, reason: "blocked by denylist" };
   }
-
-  const entries = {
-    ...cfg.plugins?.entries,
-    [pluginId]: {
-      ...(cfg.plugins?.entries?.[pluginId] as Record<string, unknown> | undefined),
-      enabled: true,
-    },
+  const allow = cfg.plugins?.allow;
+  if (
+    Array.isArray(allow) &&
+    allow.length > 0 &&
+    !allow.includes(pluginId) &&
+    !allow.includes(resolvedId)
+  ) {
+    return { config: cfg, enabled: false, pluginId: resolvedId, reason: "blocked by allowlist" };
+  }
+  return {
+    config: setPluginEnabledInConfig(cfg, resolvedId, true, options),
+    enabled: true,
+    pluginId: resolvedId,
   };
-  let next: OpenClawConfig = {
-    ...cfg,
-    plugins: {
-      ...cfg.plugins,
-      entries,
-    },
-  };
-  next = ensurePluginAllowlisted(next, pluginId);
-  return { config: next, enabled: true };
 }

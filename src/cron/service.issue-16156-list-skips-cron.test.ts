@@ -1,26 +1,16 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CronService } from "./service.js";
-import { createStartedCronServiceWithFinishedBarrier } from "./service.test-harness.js";
+import {
+  createStartedCronServiceWithFinishedBarrier,
+  setupCronServiceSuite,
+} from "./service.test-harness.js";
 
-const noopLogger = {
-  debug: vi.fn(),
-  info: vi.fn(),
-  warn: vi.fn(),
-  error: vi.fn(),
-};
-
-let fixtureRoot = "";
-let caseId = 0;
-
-async function makeStorePath() {
-  const dir = path.join(fixtureRoot, `case-${caseId++}`);
-  const storePath = path.join(dir, "cron", "jobs.json");
-  await fs.mkdir(path.dirname(storePath), { recursive: true });
-  return { storePath };
-}
+const { logger: noopLogger, makeStorePath } = setupCronServiceSuite({
+  prefix: "openclaw-cron-16156-",
+  baseTimeIso: "2025-12-13T00:00:00.000Z",
+});
 
 async function writeJobsStore(storePath: string, jobs: unknown[]) {
   await fs.mkdir(path.dirname(storePath), { recursive: true });
@@ -33,35 +23,22 @@ function createCronFromStorePath(storePath: string) {
     cronEnabled: true,
     log: noopLogger,
     enqueueSystemEvent: vi.fn(),
-    requestHeartbeatNow: vi.fn(),
+    requestHeartbeat: vi.fn(),
     runIsolatedAgentJob: vi.fn(async () => ({ status: "ok" as const })),
   });
 }
 
+function requireEnqueueSystemEventCall(
+  enqueueSystemEvent: ReturnType<typeof vi.fn>,
+): [string, { agentId?: string } | undefined] {
+  const call = enqueueSystemEvent.mock.calls[0];
+  if (!call) {
+    throw new Error("Expected enqueueSystemEvent call");
+  }
+  return call as [string, { agentId?: string } | undefined];
+}
+
 describe("#16156: cron.list() must not silently advance past-due recurring jobs", () => {
-  beforeAll(async () => {
-    fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cron-16156-"));
-  });
-
-  afterAll(async () => {
-    if (fixtureRoot) {
-      await fs.rm(fixtureRoot, { recursive: true, force: true }).catch(() => undefined);
-    }
-  });
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2025-12-13T00:00:00.000Z"));
-    noopLogger.debug.mockClear();
-    noopLogger.info.mockClear();
-    noopLogger.warn.mockClear();
-    noopLogger.error.mockClear();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
   it("does not skip a cron job when list() is called while the job is past-due", async () => {
     const store = await makeStorePath();
     const { cron, enqueueSystemEvent, finished } = createStartedCronServiceWithFinishedBarrier({
@@ -106,10 +83,9 @@ describe("#16156: cron.list() must not silently advance past-due recurring jobs"
     const updated = jobs.find((j) => j.id === job.id);
 
     // Job must have actually executed.
-    expect(enqueueSystemEvent).toHaveBeenCalledWith(
-      "cron-tick",
-      expect.objectContaining({ agentId: undefined }),
-    );
+    const [text, options] = requireEnqueueSystemEventCall(enqueueSystemEvent);
+    expect(text).toBe("cron-tick");
+    expect(options?.agentId).toBeUndefined();
     expect(updated?.state.lastStatus).toBe("ok");
     // nextRunAtMs must advance to a future minute boundary after execution.
     expect(updated?.state.nextRunAtMs).toBeGreaterThan(firstDueAt);
@@ -151,10 +127,9 @@ describe("#16156: cron.list() must not silently advance past-due recurring jobs"
     const jobs = await cron.list({ includeDisabled: true });
     const updated = jobs.find((j) => j.id === job.id);
 
-    expect(enqueueSystemEvent).toHaveBeenCalledWith(
-      "tick-5",
-      expect.objectContaining({ agentId: undefined }),
-    );
+    const [text, options] = requireEnqueueSystemEventCall(enqueueSystemEvent);
+    expect(text).toBe("tick-5");
+    expect(options?.agentId).toBeUndefined();
     expect(updated?.state.lastStatus).toBe("ok");
 
     cron.stop();

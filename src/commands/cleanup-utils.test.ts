@@ -1,8 +1,13 @@
 import path from "node:path";
-import { describe, expect, it, test } from "vitest";
+import { describe, expect, it, test, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
-import { buildCleanupPlan } from "./cleanup-utils.js";
-import { applyAgentDefaultPrimaryModel } from "./model-default.js";
+import { applyAgentDefaultPrimaryModel } from "../plugins/provider-model-primary.js";
+import type { RuntimeEnv } from "../runtime.js";
+import {
+  buildCleanupPlan,
+  removeStateAndLinkedPaths,
+  removeWorkspaceDirs,
+} from "./cleanup-utils.js";
 
 describe("buildCleanupPlan", () => {
   test("resolves inside-state flags and workspace dirs", () => {
@@ -48,5 +53,63 @@ describe("applyAgentDefaultPrimaryModel", () => {
     });
     expect(result.changed).toBe(false);
     expect(result.next).toBe(cfg);
+  });
+
+  it("normalizes retired Google Gemini primary models before writing config", () => {
+    const cfg = { agents: { defaults: {} } } as OpenClawConfig;
+    const result = applyAgentDefaultPrimaryModel({
+      cfg,
+      model: "google/gemini-3-pro-preview",
+    });
+    expect(result.changed).toBe(true);
+    expect(result.next.agents?.defaults?.model).toEqual({
+      primary: "google/gemini-3.1-pro-preview",
+    });
+  });
+});
+
+describe("cleanup path removals", () => {
+  function createRuntimeMock() {
+    return {
+      log: vi.fn<(message: string) => void>(),
+      error: vi.fn<(message: string) => void>(),
+    } as unknown as RuntimeEnv & {
+      log: ReturnType<typeof vi.fn<(message: string) => void>>;
+      error: ReturnType<typeof vi.fn<(message: string) => void>>;
+    };
+  }
+
+  it("removes state and only linked paths outside state", async () => {
+    const runtime = createRuntimeMock();
+    const tmpRoot = path.join(path.parse(process.cwd()).root, "tmp", "openclaw-cleanup");
+    await removeStateAndLinkedPaths(
+      {
+        stateDir: path.join(tmpRoot, "state"),
+        configPath: path.join(tmpRoot, "state", "openclaw.json"),
+        oauthDir: path.join(tmpRoot, "oauth"),
+        configInsideState: true,
+        oauthInsideState: false,
+      },
+      runtime,
+      { dryRun: true },
+    );
+
+    expect(runtime.log.mock.calls.map(([line]) => line.replaceAll("\\", "/"))).toEqual([
+      "[dry-run] remove /tmp/openclaw-cleanup/state",
+      "[dry-run] remove /tmp/openclaw-cleanup/oauth",
+    ]);
+  });
+
+  it("removes every workspace directory", async () => {
+    const runtime = createRuntimeMock();
+    const workspaces = ["/tmp/openclaw-workspace-1", "/tmp/openclaw-workspace-2"];
+
+    await removeWorkspaceDirs(workspaces, runtime, { dryRun: true });
+
+    const logs = runtime.log.mock.calls.map(([line]) => line);
+    expect(logs).toEqual([
+      "[dry-run] remove /tmp/openclaw-workspace-1",
+      "[dry-run] remove /tmp/openclaw-workspace-2",
+    ]);
   });
 });

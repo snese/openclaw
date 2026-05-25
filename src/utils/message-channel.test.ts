@@ -1,43 +1,39 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ChannelPlugin } from "../channels/plugins/types.js";
-import type { PluginRegistry } from "../plugins/registry.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { resolveGatewayMessageChannel } from "./message-channel.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
+import {
+  INTERNAL_NON_DELIVERY_CHANNELS,
+  isInternalNonDeliveryChannel,
+  isMarkdownCapableMessageChannel,
+  resolveGatewayMessageChannel,
+} from "./message-channel.js";
 
-const createRegistry = (channels: PluginRegistry["channels"]): PluginRegistry => ({
-  plugins: [],
-  tools: [],
-  hooks: [],
-  typedHooks: [],
-  channels,
-  commands: [],
-  providers: [],
-  gatewayHandlers: {},
-  httpHandlers: [],
-  httpRoutes: [],
-  cliRegistrars: [],
-  services: [],
-  diagnostics: [],
-});
-
-const emptyRegistry = createRegistry([]);
-
-const msteamsPlugin = {
-  id: "msteams",
+const emptyRegistry = createTestRegistry([]);
+const demoAliasPlugin: ChannelPlugin = {
+  ...createChannelTestPluginBase({
+    id: "demo-alias-channel",
+    label: "Demo Alias Channel",
+    docsPath: "/channels/demo-alias-channel",
+  }),
   meta: {
-    id: "msteams",
-    label: "Microsoft Teams",
-    selectionLabel: "Microsoft Teams (Bot Framework)",
-    docsPath: "/channels/msteams",
-    blurb: "Bot Framework; enterprise support.",
-    aliases: ["teams"],
+    ...createChannelTestPluginBase({
+      id: "demo-alias-channel",
+      label: "Demo Alias Channel",
+      docsPath: "/channels/demo-alias-channel",
+    }).meta,
+    aliases: ["workspace-chat"],
   },
-  capabilities: { chatTypes: ["direct"] },
-  config: {
-    listAccountIds: () => [],
-    resolveAccount: () => ({}),
-  },
-} satisfies ChannelPlugin;
+};
+
+const demoMarkdownPlugin: ChannelPlugin = {
+  ...createChannelTestPluginBase({
+    id: "demo-markdown-channel",
+    label: "Demo Markdown Channel",
+    docsPath: "/channels/demo-markdown-channel",
+    markdownCapable: true,
+  }),
+};
 
 describe("message-channel", () => {
   beforeEach(() => {
@@ -57,8 +53,31 @@ describe("message-channel", () => {
 
   it("normalizes plugin aliases when registered", () => {
     setActivePluginRegistry(
-      createRegistry([{ pluginId: "msteams", plugin: msteamsPlugin, source: "test" }]),
+      createTestRegistry([
+        { pluginId: "demo-alias-channel", plugin: demoAliasPlugin, source: "test" },
+      ]),
     );
-    expect(resolveGatewayMessageChannel("teams")).toBe("msteams");
+    expect(resolveGatewayMessageChannel("workspace-chat")).toBe("demo-alias-channel");
+  });
+
+  it("recognises internal non-delivery channel sources", () => {
+    for (const channel of INTERNAL_NON_DELIVERY_CHANNELS) {
+      expect(isInternalNonDeliveryChannel(channel)).toBe(true);
+    }
+    expect(isInternalNonDeliveryChannel("telegram")).toBe(false);
+    expect(isInternalNonDeliveryChannel("webchat")).toBe(false);
+    expect(isInternalNonDeliveryChannel("")).toBe(false);
+    expect(isInternalNonDeliveryChannel("HEARTBEAT")).toBe(false);
+  });
+
+  it("reads markdown capability from channel metadata", () => {
+    expect(isMarkdownCapableMessageChannel("telegram")).toBe(true);
+    expect(isMarkdownCapableMessageChannel("whatsapp")).toBe(false);
+    setActivePluginRegistry(
+      createTestRegistry([
+        { pluginId: "demo-markdown-channel", plugin: demoMarkdownPlugin, source: "test" },
+      ]),
+    );
+    expect(isMarkdownCapableMessageChannel("demo-markdown-channel")).toBe(true);
   });
 });

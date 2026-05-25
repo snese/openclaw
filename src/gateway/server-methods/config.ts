@@ -1,33 +1,32 @@
-import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
-import { listChannelPlugins } from "../../channels/plugins/index.js";
+import { execFile } from "node:child_process";
 import {
-  CONFIG_PATH,
-  loadConfig,
+  createConfigIO,
   parseConfigJson5,
   readConfigFileSnapshot,
   readConfigFileSnapshotForWrite,
   resolveConfigSnapshotHash,
+  validateConfigObjectRawWithPlugins,
   validateConfigObjectWithPlugins,
-  writeConfigFile,
 } from "../../config/config.js";
-import { applyLegacyMigrations } from "../../config/legacy.js";
+import { createMergePatch, projectSourceOntoRuntimeShape } from "../../config/io.write-prepare.js";
+import { formatConfigIssueLines } from "../../config/issue-format.js";
 import { applyMergePatch } from "../../config/merge-patch.js";
 import {
   redactConfigObject,
   redactConfigSnapshot,
   restoreRedactedValues,
 } from "../../config/redact-snapshot.js";
-import { buildConfigSchema, type ConfigSchemaResponse } from "../../config/schema.js";
-import { extractDeliveryInfo } from "../../config/sessions.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { loadGatewayRuntimeConfigSchema } from "../../config/runtime-schema.js";
+import { lookupConfigSchema, type ConfigSchemaResponse } from "../../config/schema.js";
+import type { ConfigValidationIssue, OpenClawConfig } from "../../config/types.openclaw.js";
+import { isBuiltInModelProviderOverlayId } from "../../config/zod-schema.core.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import {
-  formatDoctorNonInteractiveHint,
-  type RestartSentinelPayload,
-  writeRestartSentinel,
-} from "../../infra/restart-sentinel.js";
-import { scheduleGatewaySigusr1Restart } from "../../infra/restart.js";
-import { loadOpenClawPlugins } from "../../plugins/loader.js";
-import { diffConfigPaths } from "../config-reload.js";
+  prepareSecretsRuntimeSnapshot,
+  type PreparedSecretsRuntimeSnapshot,
+} from "../../secrets/runtime.js";
+import { diffConfigPaths } from "../config-diff.js";
+import { resolveConfigReloadMetadata } from "../config-reload-plan.js";
 import {
   formatControlPlaneActor,
   resolveControlPlaneActor,
@@ -36,16 +35,38 @@ import {
 import {
   ErrorCodes,
   errorShape,
+  formatValidationErrors,
   validateConfigApplyParams,
   validateConfigGetParams,
   validateConfigPatchParams,
+  validateConfigSchemaLookupParams,
+  validateConfigSchemaLookupResult,
   validateConfigSchemaParams,
   validateConfigSetParams,
 } from "../protocol/index.js";
 import { resolveBaseHashParam } from "./base-hash.js";
-import { parseRestartRequestParams } from "./restart-request.js";
+import {
+  commitGatewayConfigWrite,
+  didActiveSharedGatewayAuthChange,
+  didSharedGatewayAuthChange,
+  resolveGatewayConfigPath,
+  resolveGatewayConfigRestartWriteResult,
+} from "./config-write-flow.js";
 import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 import { assertValidParams } from "./validation.js";
+
+const MAX_CONFIG_ISSUES_IN_ERROR_MESSAGE = 3;
+const CONFIG_SCHEMA_RESPONSE_CACHE_TTL_MS = 5_000;
+
+let configSchemaResponseCache: {
+  expiresAtMs: number;
+  response: ConfigSchemaResponse;
+} | null = null;
+
+type ConfigOpenCommand = {
+  command: string;
+  args: string[];
+};
 
 function requireConfigBaseHash(
   params: unknown,
@@ -113,12 +134,128 @@ function parseRawConfigOrRespond(
   return rawValue;
 }
 
+function sanitizeLookupPathForLog(path: string): string {
+  const sanitized = Array.from(path, (char) => {
+    const code = char.charCodeAt(0);
+    return code < 0x20 || code === 0x7f ? "?" : char;
+  }).join("");
+  return sanitized.length > 120 ? `${sanitized.slice(0, 117)}...` : sanitized;
+}
+
+function escapePowerShellSingleQuotedString(value: string): string {
+  return value.replaceAll("'", "''");
+}
+
+export function resolveConfigOpenCommand(
+  configPath: string,
+  platform: NodeJS.Platform = process.platform,
+): ConfigOpenCommand {
+  if (platform === "win32") {
+    // Use a PowerShell string literal so the path stays data, not code.
+    return {
+      command: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `Start-Process -LiteralPath '${escapePowerShellSingleQuotedString(configPath)}'`,
+      ],
+    };
+  }
+  return {
+    command: platform === "darwin" ? "open" : "xdg-open",
+    args: [configPath],
+  };
+}
+
+function execConfigOpenCommand(command: ConfigOpenCommand): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(command.command, command.args, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function formatConfigOpenError(error: unknown): string {
+  if (
+    typeof error === "object" &&
+    error &&
+    "message" in error &&
+    typeof error.message === "string"
+  ) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOwnRecordValue(value: unknown, key: string): boolean {
+  return isRecord(value) && Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function stripBundledProviderRuntimeDefaults(params: {
+  candidate: unknown;
+  sourceConfig: unknown;
+}): unknown {
+  if (!isRecord(params.candidate)) {
+    return params.candidate;
+  }
+  const models = params.candidate.models;
+  if (!isRecord(models) || !isRecord(models.providers)) {
+    return params.candidate;
+  }
+  const sourceModels = isRecord(params.sourceConfig) ? params.sourceConfig.models : undefined;
+  const sourceProviders = isRecord(sourceModels) ? sourceModels.providers : undefined;
+
+  let nextProviders: Record<string, unknown> | undefined;
+  for (const [providerId, provider] of Object.entries(models.providers)) {
+    if (!isBuiltInModelProviderOverlayId(providerId) || !isRecord(provider)) {
+      continue;
+    }
+    const sourceProvider = isRecord(sourceProviders) ? sourceProviders[providerId] : undefined;
+    let nextProvider: Record<string, unknown> | undefined;
+    if (provider.baseUrl === "" && !hasOwnRecordValue(sourceProvider, "baseUrl")) {
+      nextProvider = { ...provider };
+      delete nextProvider.baseUrl;
+    }
+    if (
+      Array.isArray(provider.models) &&
+      provider.models.length === 0 &&
+      !hasOwnRecordValue(sourceProvider, "models")
+    ) {
+      nextProvider ??= { ...provider };
+      delete nextProvider.models;
+    }
+    if (nextProvider) {
+      nextProviders ??= { ...models.providers };
+      nextProviders[providerId] = nextProvider;
+    }
+  }
+  if (!nextProviders) {
+    return params.candidate;
+  }
+  return {
+    ...params.candidate,
+    models: {
+      ...models,
+      providers: nextProviders,
+    },
+  };
+}
+
 function parseValidateConfigFromRawOrRespond(
   params: unknown,
   requestName: string,
   snapshot: Awaited<ReturnType<typeof readConfigFileSnapshot>>,
   respond: RespondFn,
-): { config: OpenClawConfig; schema: ConfigSchemaResponse } | null {
+): { config: OpenClawConfig; writeConfig: OpenClawConfig; schema: ConfigSchemaResponse } | null {
   const rawValue = parseRawConfigOrRespond(params, requestName, respond);
   if (!rawValue) {
     return null;
@@ -138,109 +275,110 @@ function parseValidateConfigFromRawOrRespond(
     );
     return null;
   }
-  const validated = validateConfigObjectWithPlugins(restored.result);
+  const projectedValidationCandidate = snapshot.valid
+    ? applyMergePatch(
+        projectSourceOntoRuntimeShape(snapshot.resolved, snapshot.config),
+        createMergePatch(snapshot.config, restored.result),
+      )
+    : restored.result;
+  const validationCandidate = stripBundledProviderRuntimeDefaults({
+    candidate: projectedValidationCandidate,
+    sourceConfig: snapshot.parsed,
+  });
+  const sourceValidated = validateConfigObjectRawWithPlugins(validationCandidate);
+  if (!sourceValidated.ok) {
+    respond(
+      false,
+      undefined,
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        summarizeConfigValidationIssues(sourceValidated.issues),
+        {
+          details: { issues: sourceValidated.issues },
+        },
+      ),
+    );
+    return null;
+  }
+  const validated = validateConfigObjectWithPlugins(validationCandidate);
   if (!validated.ok) {
     respond(
       false,
       undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, "invalid config", {
+      errorShape(ErrorCodes.INVALID_REQUEST, summarizeConfigValidationIssues(validated.issues), {
         details: { issues: validated.issues },
       }),
     );
     return null;
   }
-  return { config: validated.config, schema };
-}
-
-function resolveConfigRestartRequest(params: unknown): {
-  sessionKey: string | undefined;
-  note: string | undefined;
-  restartDelayMs: number | undefined;
-  deliveryContext: ReturnType<typeof extractDeliveryInfo>["deliveryContext"];
-  threadId: ReturnType<typeof extractDeliveryInfo>["threadId"];
-} {
-  const { sessionKey, note, restartDelayMs } = parseRestartRequestParams(params);
-
-  // Extract deliveryContext + threadId for routing after restart
-  // Supports both :thread: (most channels) and :topic: (Telegram)
-  const { deliveryContext, threadId } = extractDeliveryInfo(sessionKey);
-
   return {
-    sessionKey,
-    note,
-    restartDelayMs,
-    deliveryContext,
-    threadId,
+    config: validated.config,
+    writeConfig: validationCandidate as OpenClawConfig,
+    schema,
   };
 }
 
-function buildConfigRestartSentinelPayload(params: {
-  kind: RestartSentinelPayload["kind"];
-  mode: string;
-  sessionKey: string | undefined;
-  deliveryContext: ReturnType<typeof extractDeliveryInfo>["deliveryContext"];
-  threadId: ReturnType<typeof extractDeliveryInfo>["threadId"];
-  note: string | undefined;
-}): RestartSentinelPayload {
-  return {
-    kind: params.kind,
-    status: "ok",
-    ts: Date.now(),
-    sessionKey: params.sessionKey,
-    deliveryContext: params.deliveryContext,
-    threadId: params.threadId,
-    message: params.note ?? null,
-    doctorHint: formatDoctorNonInteractiveHint(),
-    stats: {
-      mode: params.mode,
-      root: CONFIG_PATH,
-    },
-  };
+function summarizeConfigValidationIssues(issues: ReadonlyArray<ConfigValidationIssue>): string {
+  const trimmed = issues.slice(0, MAX_CONFIG_ISSUES_IN_ERROR_MESSAGE);
+  const lines = formatConfigIssueLines(trimmed, "", { normalizeRoot: true })
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return "invalid config";
+  }
+  const hiddenCount = Math.max(0, issues.length - lines.length);
+  return `invalid config: ${lines.join("; ")}${
+    hiddenCount > 0 ? ` (+${hiddenCount} more issue${hiddenCount === 1 ? "" : "s"})` : ""
+  }`;
 }
 
-async function tryWriteRestartSentinelPayload(
-  payload: RestartSentinelPayload,
-): Promise<string | null> {
+async function ensureResolvableSecretRefsOrRespond(params: {
+  config: OpenClawConfig;
+  respond: RespondFn;
+}): Promise<PreparedSecretsRuntimeSnapshot | null> {
   try {
-    return await writeRestartSentinel(payload);
-  } catch {
+    return await prepareSecretsRuntimeSnapshot({
+      config: params.config,
+      includeAuthStoreRefs: false,
+    });
+  } catch (error) {
+    const details = formatErrorMessage(error);
+    params.respond(
+      false,
+      undefined,
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        `invalid config: active SecretRef resolution failed (${details})`,
+      ),
+    );
     return null;
   }
 }
 
+export function clearConfigSchemaResponseCacheForTests() {
+  configSchemaResponseCache = null;
+}
+
+export function loadConfigSchemaResponseForTests(): ConfigSchemaResponse {
+  return loadSchemaWithPlugins();
+}
+
+function clearConfigSchemaResponseCache() {
+  configSchemaResponseCache = null;
+}
+
 function loadSchemaWithPlugins(): ConfigSchemaResponse {
-  const cfg = loadConfig();
-  const workspaceDir = resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
-  const pluginRegistry = loadOpenClawPlugins({
-    config: cfg,
-    cache: true,
-    workspaceDir,
-    logger: {
-      info: () => {},
-      warn: () => {},
-      error: () => {},
-      debug: () => {},
-    },
-  });
-  // Note: We can't easily cache this, as there are no callback that can invalidate
-  // our cache. However, both loadConfig() and loadOpenClawPlugins() already cache
-  // their results, and buildConfigSchema() is just a cheap transformation.
-  return buildConfigSchema({
-    plugins: pluginRegistry.plugins.map((plugin) => ({
-      id: plugin.id,
-      name: plugin.name,
-      description: plugin.description,
-      configUiHints: plugin.configUiHints,
-      configSchema: plugin.configJsonSchema,
-    })),
-    channels: listChannelPlugins().map((entry) => ({
-      id: entry.id,
-      label: entry.meta.label,
-      description: entry.meta.blurb,
-      configSchema: entry.configSchema?.schema,
-      configUiHints: entry.configSchema?.uiHints,
-    })),
-  });
+  const now = Date.now();
+  if (configSchemaResponseCache && configSchemaResponseCache.expiresAtMs > now) {
+    return configSchemaResponseCache.response;
+  }
+
+  const response = loadGatewayRuntimeConfigSchema();
+  configSchemaResponseCache = {
+    expiresAtMs: Date.now() + CONFIG_SCHEMA_RESPONSE_CACHE_TTL_MS,
+    response,
+  };
+  return response;
 }
 
 export const configHandlers: GatewayRequestHandlers = {
@@ -258,7 +396,40 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     respond(true, loadSchemaWithPlugins(), undefined);
   },
-  "config.set": async ({ params, respond }) => {
+  "config.schema.lookup": ({ params, respond, context }) => {
+    if (
+      !assertValidParams(params, validateConfigSchemaLookupParams, "config.schema.lookup", respond)
+    ) {
+      return;
+    }
+    const path = (params as { path: string }).path;
+    const schema = loadSchemaWithPlugins();
+    const result = lookupConfigSchema(schema, path, resolveConfigReloadMetadata);
+    if (!result) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "config schema path not found"),
+      );
+      return;
+    }
+    if (!validateConfigSchemaLookupResult(result)) {
+      const errors = validateConfigSchemaLookupResult.errors ?? [];
+      context.logGateway.warn(
+        `config.schema.lookup produced invalid payload for ${sanitizeLookupPathForLog(path)}: ${formatValidationErrors(errors)}`,
+      );
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "config.schema.lookup returned invalid payload", {
+          details: { errors },
+        }),
+      );
+      return;
+    }
+    respond(true, result, undefined);
+  },
+  "config.set": async ({ params, respond, context }) => {
     if (!assertValidParams(params, validateConfigSetParams, "config.set", respond)) {
       return;
     }
@@ -270,16 +441,26 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!parsed) {
       return;
     }
-    await writeConfigFile(parsed.config, writeOptions);
+    if (!(await ensureResolvableSecretRefsOrRespond({ config: parsed.config, respond }))) {
+      return;
+    }
+    const writeResult = await commitGatewayConfigWrite({
+      snapshot,
+      writeOptions,
+      nextConfig: parsed.writeConfig,
+      context,
+    });
+    clearConfigSchemaResponseCache();
     respond(
       true,
       {
         ok: true,
-        path: CONFIG_PATH,
-        config: redactConfigObject(parsed.config, parsed.schema.uiHints),
+        path: writeResult.path,
+        config: redactConfigObject(writeResult.config, parsed.schema.uiHints),
       },
       undefined,
     );
+    writeResult.queueFollowUp();
   },
   "config.patch": async ({ params, respond, client, context }) => {
     if (!assertValidParams(params, validateConfigPatchParams, "config.patch", respond)) {
@@ -342,58 +523,101 @@ export const configHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const migrated = applyLegacyMigrations(restoredMerge.result);
-    const resolved = migrated.next ?? restoredMerge.result;
-    const validated = validateConfigObjectWithPlugins(resolved);
+    const restoredChangedPaths = diffConfigPaths(snapshot.config, restoredMerge.result);
+    const actor = resolveControlPlaneActor(client);
+    if (restoredChangedPaths.length === 0) {
+      context?.logGateway?.info(
+        `config.patch noop ${formatControlPlaneActor(actor)} (no changed paths)`,
+      );
+      respond(
+        true,
+        {
+          ok: true,
+          noop: true,
+          path: resolveGatewayConfigPath(snapshot),
+          config: redactConfigObject(snapshot.config, schemaPatch.uiHints),
+        },
+        undefined,
+      );
+      return;
+    }
+    const validated = validateConfigObjectWithPlugins(restoredMerge.result);
     if (!validated.ok) {
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "invalid config", {
+        errorShape(ErrorCodes.INVALID_REQUEST, summarizeConfigValidationIssues(validated.issues), {
           details: { issues: validated.issues },
         }),
       );
       return;
     }
+    const preparedSecretsSnapshot = await ensureResolvableSecretRefsOrRespond({
+      config: validated.config,
+      respond,
+    });
+    if (!preparedSecretsSnapshot) {
+      return;
+    }
     const changedPaths = diffConfigPaths(snapshot.config, validated.config);
-    const actor = resolveControlPlaneActor(client);
+
+    // No-op: if the validated config is identical to the current config,
+    // skip the file write and SIGUSR1 restart entirely. This avoids a full
+    // gateway restart (and the resulting connection drop) when a control-plane
+    // client re-sends the same config (e.g. hot-apply with no actual changes).
+    if (changedPaths.length === 0) {
+      context?.logGateway?.info(
+        `config.patch noop ${formatControlPlaneActor(actor)} (no changed paths)`,
+      );
+      respond(
+        true,
+        {
+          ok: true,
+          noop: true,
+          path: resolveGatewayConfigPath(snapshot),
+          config: redactConfigObject(validated.config, schemaPatch.uiHints),
+        },
+        undefined,
+      );
+      return;
+    }
+
     context?.logGateway?.info(
       `config.patch write ${formatControlPlaneActor(actor)} changedPaths=${summarizeChangedPaths(changedPaths)} restartReason=config.patch`,
     );
-    await writeConfigFile(validated.config, writeOptions);
+    // Compare before the write so we invalidate clients authenticated against the
+    // previous shared secret immediately after the config update succeeds.
+    const disconnectSharedAuthClients =
+      didSharedGatewayAuthChange(snapshot.config, validated.config) ||
+      didActiveSharedGatewayAuthChange({
+        fallbackPrev: snapshot.config,
+        next: preparedSecretsSnapshot.config,
+      });
+    const writeResult = await commitGatewayConfigWrite({
+      snapshot,
+      writeOptions,
+      nextConfig: validated.config,
+      context,
+      disconnectSharedAuthClients,
+    });
+    clearConfigSchemaResponseCache();
 
-    const { sessionKey, note, restartDelayMs, deliveryContext, threadId } =
-      resolveConfigRestartRequest(params);
-    const payload = buildConfigRestartSentinelPayload({
+    const { payload, sentinelPath, restart } = await resolveGatewayConfigRestartWriteResult({
+      requestParams: params,
       kind: "config-patch",
       mode: "config.patch",
-      sessionKey,
-      deliveryContext,
-      threadId,
-      note,
+      configPath: writeResult.path,
+      changedPaths,
+      nextConfig: writeResult.config,
+      actor,
+      context,
     });
-    const sentinelPath = await tryWriteRestartSentinelPayload(payload);
-    const restart = scheduleGatewaySigusr1Restart({
-      delayMs: restartDelayMs,
-      reason: "config.patch",
-      audit: {
-        actor: actor.actor,
-        deviceId: actor.deviceId,
-        clientIp: actor.clientIp,
-        changedPaths,
-      },
-    });
-    if (restart.coalesced) {
-      context?.logGateway?.warn(
-        `config.patch restart coalesced ${formatControlPlaneActor(actor)} delayMs=${restart.delayMs}`,
-      );
-    }
     respond(
       true,
       {
         ok: true,
-        path: CONFIG_PATH,
-        config: redactConfigObject(validated.config, schemaPatch.uiHints),
+        path: writeResult.path,
+        config: redactConfigObject(writeResult.config, schemaPatch.uiHints),
         restart,
         sentinel: {
           path: sentinelPath,
@@ -402,6 +626,7 @@ export const configHandlers: GatewayRequestHandlers = {
       },
       undefined,
     );
+    writeResult.queueFollowUp();
   },
   "config.apply": async ({ params, respond, client, context }) => {
     if (!assertValidParams(params, validateConfigApplyParams, "config.apply", respond)) {
@@ -415,45 +640,51 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!parsed) {
       return;
     }
+    const preparedSecretsSnapshot = await ensureResolvableSecretRefsOrRespond({
+      config: parsed.config,
+      respond,
+    });
+    if (!preparedSecretsSnapshot) {
+      return;
+    }
     const changedPaths = diffConfigPaths(snapshot.config, parsed.config);
     const actor = resolveControlPlaneActor(client);
     context?.logGateway?.info(
       `config.apply write ${formatControlPlaneActor(actor)} changedPaths=${summarizeChangedPaths(changedPaths)} restartReason=config.apply`,
     );
-    await writeConfigFile(parsed.config, writeOptions);
+    // Compare before the write so we invalidate clients authenticated against the
+    // previous shared secret immediately after the config update succeeds.
+    const disconnectSharedAuthClients =
+      didSharedGatewayAuthChange(snapshot.config, parsed.config) ||
+      didActiveSharedGatewayAuthChange({
+        fallbackPrev: snapshot.config,
+        next: preparedSecretsSnapshot.config,
+      });
+    const writeResult = await commitGatewayConfigWrite({
+      snapshot,
+      writeOptions,
+      nextConfig: parsed.writeConfig,
+      context,
+      disconnectSharedAuthClients,
+    });
+    clearConfigSchemaResponseCache();
 
-    const { sessionKey, note, restartDelayMs, deliveryContext, threadId } =
-      resolveConfigRestartRequest(params);
-    const payload = buildConfigRestartSentinelPayload({
+    const { payload, sentinelPath, restart } = await resolveGatewayConfigRestartWriteResult({
+      requestParams: params,
       kind: "config-apply",
       mode: "config.apply",
-      sessionKey,
-      deliveryContext,
-      threadId,
-      note,
+      configPath: writeResult.path,
+      changedPaths,
+      nextConfig: writeResult.config,
+      actor,
+      context,
     });
-    const sentinelPath = await tryWriteRestartSentinelPayload(payload);
-    const restart = scheduleGatewaySigusr1Restart({
-      delayMs: restartDelayMs,
-      reason: "config.apply",
-      audit: {
-        actor: actor.actor,
-        deviceId: actor.deviceId,
-        clientIp: actor.clientIp,
-        changedPaths,
-      },
-    });
-    if (restart.coalesced) {
-      context?.logGateway?.warn(
-        `config.apply restart coalesced ${formatControlPlaneActor(actor)} delayMs=${restart.delayMs}`,
-      );
-    }
     respond(
       true,
       {
         ok: true,
-        path: CONFIG_PATH,
-        config: redactConfigObject(parsed.config, parsed.schema.uiHints),
+        path: writeResult.path,
+        config: redactConfigObject(writeResult.config, parsed.schema.uiHints),
         restart,
         sentinel: {
           path: sentinelPath,
@@ -462,5 +693,25 @@ export const configHandlers: GatewayRequestHandlers = {
       },
       undefined,
     );
+    writeResult.queueFollowUp();
+  },
+  "config.openFile": async ({ params, respond, context }) => {
+    if (!assertValidParams(params, validateConfigGetParams, "config.openFile", respond)) {
+      return;
+    }
+    const configPath = createConfigIO().configPath;
+    try {
+      await execConfigOpenCommand(resolveConfigOpenCommand(configPath));
+      respond(true, { ok: true, path: configPath }, undefined);
+    } catch (error) {
+      context?.logGateway?.warn(
+        `config.openFile failed path=${sanitizeLookupPathForLog(configPath)}: ${formatConfigOpenError(error)}`,
+      );
+      respond(
+        true,
+        { ok: false, path: configPath, error: "failed to open config file" },
+        undefined,
+      );
+    }
   },
 };

@@ -85,6 +85,7 @@ export function applyQueueDropPolicy<T>(params: {
   queue: QueueState<T>;
   summarize: (item: T) => string;
   summaryLimit?: number;
+  onDrop?: (items: T[]) => void;
 }): boolean {
   const cap = params.queue.cap;
   if (cap <= 0 || params.queue.items.length < cap) {
@@ -95,6 +96,7 @@ export function applyQueueDropPolicy<T>(params: {
   }
   const dropCount = params.queue.items.length - cap + 1;
   const dropped = params.queue.items.splice(0, dropCount);
+  params.onDrop?.(dropped);
   if (params.queue.dropPolicy === "summarize") {
     for (const item of dropped) {
       params.queue.droppedCount += 1;
@@ -112,6 +114,9 @@ export function waitForQueueDebounce(queue: {
   debounceMs: number;
   lastEnqueuedAt: number;
 }): Promise<void> {
+  if (process.env.OPENCLAW_TEST_FAST === "1") {
+    return Promise.resolve();
+  }
   const debounceMs = Math.max(0, queue.debounceMs);
   if (debounceMs <= 0) {
     return Promise.resolve();
@@ -127,6 +132,18 @@ export function waitForQueueDebounce(queue: {
     };
     check();
   });
+}
+
+export function beginQueueDrain<T extends { draining: boolean }>(
+  map: Map<string, T>,
+  key: string,
+): T | undefined {
+  const queue = map.get(key);
+  if (!queue || queue.draining) {
+    return undefined;
+  }
+  queue.draining = true;
+  return queue;
 }
 
 export async function drainNextQueueItem<T>(
@@ -157,6 +174,23 @@ export async function drainCollectItemIfNeeded<T>(params: {
   }
   const drained = await drainNextQueueItem(params.items, params.run);
   return drained ? "drained" : "empty";
+}
+
+export async function drainCollectQueueStep<T>(params: {
+  collectState: { forceIndividualCollect: boolean };
+  isCrossChannel: boolean;
+  items: T[];
+  run: (item: T) => Promise<void>;
+}): Promise<"skipped" | "drained" | "empty"> {
+  return await drainCollectItemIfNeeded({
+    forceIndividualCollect: params.collectState.forceIndividualCollect,
+    isCrossChannel: params.isCrossChannel,
+    setForceIndividualCollect: (next) => {
+      params.collectState.forceIndividualCollect = next;
+    },
+    items: params.items,
+    run: params.run,
+  });
 }
 
 export function buildQueueSummaryPrompt(params: {
@@ -203,7 +237,6 @@ export function hasCrossChannelItems<T>(
   resolveKey: (item: T) => { key?: string; cross?: boolean },
 ): boolean {
   const keys = new Set<string>();
-  let hasUnkeyed = false;
 
   for (const item of items) {
     const resolved = resolveKey(item);
@@ -211,17 +244,10 @@ export function hasCrossChannelItems<T>(
       return true;
     }
     if (!resolved.key) {
-      hasUnkeyed = true;
       continue;
     }
     keys.add(resolved.key);
   }
 
-  if (keys.size === 0) {
-    return false;
-  }
-  if (hasUnkeyed) {
-    return true;
-  }
   return keys.size > 1;
 }

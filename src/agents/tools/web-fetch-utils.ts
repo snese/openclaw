@@ -1,34 +1,6 @@
+import { sanitizeHtml, stripInvisibleUnicode } from "./web-fetch-visibility.js";
+
 export type ExtractMode = "markdown" | "text";
-
-const READABILITY_MAX_HTML_CHARS = 1_000_000;
-const READABILITY_MAX_ESTIMATED_NESTING_DEPTH = 3_000;
-
-let readabilityDepsPromise:
-  | Promise<{
-      Readability: typeof import("@mozilla/readability").Readability;
-      parseHTML: typeof import("linkedom").parseHTML;
-    }>
-  | undefined;
-
-async function loadReadabilityDeps(): Promise<{
-  Readability: typeof import("@mozilla/readability").Readability;
-  parseHTML: typeof import("linkedom").parseHTML;
-}> {
-  if (!readabilityDepsPromise) {
-    readabilityDepsPromise = Promise.all([import("@mozilla/readability"), import("linkedom")]).then(
-      ([readability, linkedom]) => ({
-        Readability: readability.Readability,
-        parseHTML: linkedom.parseHTML,
-      }),
-    );
-  }
-  try {
-    return await readabilityDepsPromise;
-  } catch (error) {
-    readabilityDepsPromise = undefined;
-    throw error;
-  }
-}
 
 function decodeEntities(value: string): string {
   return value
@@ -46,7 +18,7 @@ function stripTags(value: string): string {
   return decodeEntities(value.replace(/<[^>]+>/g, ""));
 }
 
-function normalizeWhitespace(value: string): string {
+export function normalizeWhitespace(value: string): string {
   return value
     .replace(/\r/g, "")
     .replace(/[ \t]+\n/g, "\n")
@@ -110,140 +82,18 @@ export function truncateText(
   return { text: value.slice(0, maxChars), truncated: true };
 }
 
-function exceedsEstimatedHtmlNestingDepth(html: string, maxDepth: number): boolean {
-  // Cheap heuristic to skip Readability+DOM parsing on pathological HTML (deep nesting => stack/memory blowups).
-  // Not an HTML parser; tuned to catch attacker-controlled "<div><div>..." cases.
-  const voidTags = new Set([
-    "area",
-    "base",
-    "br",
-    "col",
-    "embed",
-    "hr",
-    "img",
-    "input",
-    "link",
-    "meta",
-    "param",
-    "source",
-    "track",
-    "wbr",
-  ]);
-
-  let depth = 0;
-  const len = html.length;
-  for (let i = 0; i < len; i++) {
-    if (html.charCodeAt(i) !== 60) {
-      continue; // '<'
-    }
-    const next = html.charCodeAt(i + 1);
-    if (next === 33 || next === 63) {
-      continue; // <! ...> or <? ...>
-    }
-
-    let j = i + 1;
-    let closing = false;
-    if (html.charCodeAt(j) === 47) {
-      closing = true;
-      j += 1;
-    }
-
-    while (j < len && html.charCodeAt(j) <= 32) {
-      j += 1;
-    }
-
-    const nameStart = j;
-    while (j < len) {
-      const c = html.charCodeAt(j);
-      const isNameChar =
-        (c >= 65 && c <= 90) || // A-Z
-        (c >= 97 && c <= 122) || // a-z
-        (c >= 48 && c <= 57) || // 0-9
-        c === 58 || // :
-        c === 45; // -
-      if (!isNameChar) {
-        break;
-      }
-      j += 1;
-    }
-
-    const tagName = html.slice(nameStart, j).toLowerCase();
-    if (!tagName) {
-      continue;
-    }
-
-    if (closing) {
-      depth = Math.max(0, depth - 1);
-      continue;
-    }
-
-    if (voidTags.has(tagName)) {
-      continue;
-    }
-
-    // Best-effort self-closing detection: scan a short window for "/>".
-    let selfClosing = false;
-    for (let k = j; k < len && k < j + 200; k++) {
-      const c = html.charCodeAt(k);
-      if (c === 62) {
-        if (html.charCodeAt(k - 1) === 47) {
-          selfClosing = true;
-        }
-        break;
-      }
-    }
-    if (selfClosing) {
-      continue;
-    }
-
-    depth += 1;
-    if (depth > maxDepth) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export async function extractReadableContent(params: {
+export async function extractBasicHtmlContent(params: {
   html: string;
-  url: string;
   extractMode: ExtractMode;
 }): Promise<{ text: string; title?: string } | null> {
-  const fallback = (): { text: string; title?: string } => {
-    const rendered = htmlToMarkdown(params.html);
-    if (params.extractMode === "text") {
-      const text = markdownToText(rendered.text) || normalizeWhitespace(stripTags(params.html));
-      return { text, title: rendered.title };
-    }
-    return rendered;
-  };
-  if (
-    params.html.length > READABILITY_MAX_HTML_CHARS ||
-    exceedsEstimatedHtmlNestingDepth(params.html, READABILITY_MAX_ESTIMATED_NESTING_DEPTH)
-  ) {
-    return fallback();
+  const cleanHtml = await sanitizeHtml(params.html);
+  const rendered = htmlToMarkdown(cleanHtml);
+  if (params.extractMode === "text") {
+    const text =
+      stripInvisibleUnicode(markdownToText(rendered.text)) ||
+      stripInvisibleUnicode(normalizeWhitespace(stripTags(cleanHtml)));
+    return text ? { text, title: rendered.title } : null;
   }
-  try {
-    const { Readability, parseHTML } = await loadReadabilityDeps();
-    const { document } = parseHTML(params.html);
-    try {
-      (document as { baseURI?: string }).baseURI = params.url;
-    } catch {
-      // Best-effort base URI for relative links.
-    }
-    const reader = new Readability(document, { charThreshold: 0 });
-    const parsed = reader.parse();
-    if (!parsed?.content) {
-      return fallback();
-    }
-    const title = parsed.title || undefined;
-    if (params.extractMode === "text") {
-      const text = normalizeWhitespace(parsed.textContent ?? "");
-      return text ? { text, title } : fallback();
-    }
-    const rendered = htmlToMarkdown(parsed.content);
-    return { text: rendered.text, title: title ?? rendered.title };
-  } catch {
-    return fallback();
-  }
+  const text = stripInvisibleUnicode(rendered.text);
+  return text ? { text, title: rendered.title } : null;
 }

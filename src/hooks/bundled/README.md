@@ -6,9 +6,9 @@ This directory contains hooks that ship with OpenClaw. These hooks are automatic
 
 ### 💾 session-memory
 
-Automatically saves session context to memory when you issue `/new`.
+Automatically saves session context to memory when you issue `/new` or `/reset`.
 
-**Events**: `command:new`
+**Events**: `command:new`, `command:reset`
 **What it does**: Creates a dated memory file with LLM-generated slug based on conversation content.
 **Output**: `<workspace>/memory/YYYY-MM-DD-slug.md` (defaults to `~/.openclaw/workspace`)
 
@@ -170,8 +170,10 @@ Currently supported events:
 - **command:stop**: `/stop` command
 - **agent:bootstrap**: Before workspace bootstrap files are injected
 - **gateway:startup**: Gateway startup (after channels start)
-
-More event types coming soon (session lifecycle, agent errors, etc.).
+- **session:compact:before**: Pre-compaction snapshot before the embedded runner rewrites session context
+- **session:compact:after**: Post-compaction snapshot after the runner replaces session context
+- **message:received**: Inbound channel message accepted for dispatch
+- **message:sent**: Outbound channel message delivered (canonical payload only)
 
 ## Handler API
 
@@ -179,8 +181,8 @@ Hook handlers receive an `InternalHookEvent` object:
 
 ```typescript
 interface InternalHookEvent {
-  type: "command" | "session" | "agent" | "gateway";
-  action: string; // e.g., 'new', 'reset', 'stop'
+  type: "command" | "session" | "agent" | "gateway" | "message";
+  action: string; // e.g., 'new', 'reset', 'stop', 'compact:before', 'received', 'sent'
   sessionKey: string;
   context: Record<string, unknown>;
   timestamp: Date;

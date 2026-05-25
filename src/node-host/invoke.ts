@@ -1,72 +1,48 @@
 import { spawn } from "node:child_process";
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveAgentConfig } from "../agents/agent-scope.js";
-import { loadConfig } from "../config/config.js";
 import { GatewayClient } from "../gateway/client.js";
 import {
-  addAllowlistEntry,
-  analyzeArgvCommand,
-  evaluateExecAllowlist,
-  evaluateShellAllowlist,
-  requiresExecApproval,
-  normalizeExecApprovals,
-  mergeExecApprovalsSocketDefaults,
-  recordAllowlistUse,
-  resolveExecApprovals,
-  resolveSafeBins,
   ensureExecApprovals,
+  mergeExecApprovalsSocketDefaults,
+  normalizeExecApprovals,
   readExecApprovalsSnapshot,
   saveExecApprovals,
   type ExecAsk,
   type ExecApprovalsFile,
-  type ExecAllowlistEntry,
-  type ExecCommandSegment,
+  type ExecApprovalsResolved,
   type ExecSecurity,
 } from "../infra/exec-approvals.js";
 import {
   requestExecHostViaSocket,
   type ExecHostRequest,
   type ExecHostResponse,
-  type ExecHostRunResult,
 } from "../infra/exec-host.js";
-import { getTrustedSafeBinDirs } from "../infra/exec-safe-bin-trust.js";
-import { validateSystemRunCommandConsistency } from "../infra/system-run-command.js";
-import { runBrowserProxyCommand } from "./invoke-browser.js";
+import { sanitizeHostExecEnv } from "../infra/host-env-security.js";
+import {
+  decodeWindowsOutputBuffer,
+  resolveWindowsConsoleEncoding,
+} from "../infra/windows-encoding.js";
+import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import { buildSystemRunApprovalPlan, handleSystemRunInvoke } from "./invoke-system-run.js";
+import type {
+  ExecEventPayload,
+  ExecFinishedEventParams,
+  RunResult,
+  SkillBinsProvider,
+  SystemRunParams,
+} from "./invoke-types.js";
+import { invokeRegisteredNodeHostCommand } from "./plugin-node-host.js";
 
 const OUTPUT_CAP = 200_000;
 const OUTPUT_EVENT_TAIL = 20_000;
 const DEFAULT_NODE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-const execHostEnforced = process.env.OPENCLAW_NODE_EXEC_HOST?.trim().toLowerCase() === "app";
+const execHostEnforced =
+  normalizeLowercaseStringOrEmpty(process.env.OPENCLAW_NODE_EXEC_HOST ?? "") === "app";
 const execHostFallbackAllowed =
-  process.env.OPENCLAW_NODE_EXEC_FALLBACK?.trim().toLowerCase() !== "0";
-
-const blockedEnvKeys = new Set([
-  "NODE_OPTIONS",
-  "PYTHONHOME",
-  "PYTHONPATH",
-  "PERL5LIB",
-  "PERL5OPT",
-  "RUBYOPT",
-]);
-
-const blockedEnvPrefixes = ["DYLD_", "LD_"];
-
-type SystemRunParams = {
-  command: string[];
-  rawCommand?: string | null;
-  cwd?: string | null;
-  env?: Record<string, string>;
-  timeoutMs?: number | null;
-  needsScreenRecording?: boolean | null;
-  agentId?: string | null;
-  sessionKey?: string | null;
-  approved?: boolean | null;
-  approvalDecision?: string | null;
-  runId?: string | null;
-};
+  normalizeLowercaseStringOrEmpty(process.env.OPENCLAW_NODE_EXEC_FALLBACK ?? "") !== "0";
+const preferMacAppExecHost = process.platform === "darwin" && execHostEnforced;
 
 type SystemWhichParams = {
   bins: string[];
@@ -84,29 +60,7 @@ type ExecApprovalsSnapshot = {
   file: ExecApprovalsFile;
 };
 
-type RunResult = {
-  exitCode?: number;
-  timedOut: boolean;
-  success: boolean;
-  stdout: string;
-  stderr: string;
-  error?: string | null;
-  truncated: boolean;
-};
-
-type ExecEventPayload = {
-  sessionKey: string;
-  runId: string;
-  host: string;
-  command?: string;
-  exitCode?: number;
-  timedOut?: boolean;
-  success?: boolean;
-  output?: string;
-  reason?: string;
-};
-
-export type NodeInvokeRequestPayload = {
+type NodeInvokeRequestPayload = {
   id: string;
   nodeId: string;
   command: string;
@@ -115,9 +69,7 @@ export type NodeInvokeRequestPayload = {
   idempotencyKey?: string | null;
 };
 
-export type SkillBinsProvider = {
-  current(force?: boolean): Promise<Set<string>>;
-};
+export type { SkillBinsProvider } from "./invoke-types.js";
 
 function resolveExecSecurity(value?: string): ExecSecurity {
   return value === "deny" || value === "allowlist" || value === "full" ? value : "allowlist";
@@ -128,7 +80,7 @@ function isCmdExeInvocation(argv: string[]): boolean {
   if (!token) {
     return false;
   }
-  const base = path.win32.basename(token).toLowerCase();
+  const base = normalizeLowercaseStringOrEmpty(path.win32.basename(token));
   return base === "cmd.exe" || base === "cmd";
 }
 
@@ -136,33 +88,8 @@ function resolveExecAsk(value?: string): ExecAsk {
   return value === "off" || value === "on-miss" || value === "always" ? value : "on-miss";
 }
 
-export function sanitizeEnv(
-  overrides?: Record<string, string> | null,
-): Record<string, string> | undefined {
-  if (!overrides) {
-    return undefined;
-  }
-  const merged = { ...process.env } as Record<string, string>;
-  for (const [rawKey, value] of Object.entries(overrides)) {
-    const key = rawKey.trim();
-    if (!key) {
-      continue;
-    }
-    const upper = key.toUpperCase();
-    // PATH is part of the security boundary (command resolution + safe-bin checks). Never allow
-    // request-scoped PATH overrides from agents/gateways.
-    if (upper === "PATH") {
-      continue;
-    }
-    if (blockedEnvKeys.has(upper)) {
-      continue;
-    }
-    if (blockedEnvPrefixes.some((prefix) => upper.startsWith(prefix))) {
-      continue;
-    }
-    merged[key] = value;
-  }
-  return merged;
+export function sanitizeEnv(overrides?: Record<string, string> | null): Record<string, string> {
+  return sanitizeHostExecEnv({ overrides, blockPathOverrides: true });
 }
 
 function truncateOutput(raw: string, maxChars: number): { text: string; truncated: boolean } {
@@ -170,6 +97,14 @@ function truncateOutput(raw: string, maxChars: number): { text: string; truncate
     return { text: raw, truncated: false };
   }
   return { text: `... (truncated) ${raw.slice(raw.length - maxChars)}`, truncated: true };
+}
+
+export function decodeCapturedOutputBuffer(params: {
+  buffer: Buffer;
+  platform?: NodeJS.Platform;
+  windowsEncoding?: string | null;
+}): string {
+  return decodeWindowsOutputBuffer(params);
 }
 
 function redactExecApprovals(file: ExecApprovalsFile): ExecApprovalsFile {
@@ -206,12 +141,13 @@ async function runCommand(
   timeoutMs: number | undefined,
 ): Promise<RunResult> {
   return await new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let outputLen = 0;
     let truncated = false;
     let timedOut = false;
     let settled = false;
+    const windowsEncoding = resolveWindowsConsoleEncoding();
 
     const child = spawn(argv[0], argv.slice(1), {
       cwd,
@@ -227,12 +163,11 @@ async function runCommand(
       }
       const remaining = OUTPUT_CAP - outputLen;
       const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
-      const str = slice.toString("utf8");
       outputLen += slice.length;
       if (target === "stdout") {
-        stdout += str;
+        stdoutChunks.push(slice);
       } else {
-        stderr += str;
+        stderrChunks.push(slice);
       }
       if (chunk.length > remaining) {
         truncated = true;
@@ -262,6 +197,14 @@ async function runCommand(
       if (timer) {
         clearTimeout(timer);
       }
+      const stdout = decodeCapturedOutputBuffer({
+        buffer: Buffer.concat(stdoutChunks),
+        windowsEncoding,
+      });
+      const stderr = decodeCapturedOutputBuffer({
+        buffer: Buffer.concat(stderrChunks),
+        windowsEncoding,
+      });
       resolve({
         exitCode,
         timedOut,
@@ -300,7 +243,7 @@ function resolveExecutable(bin: string, env?: Record<string, string>) {
     process.platform === "win32"
       ? (process.env.PATHEXT ?? process.env.PathExt ?? ".EXE;.CMD;.BAT;.COM")
           .split(";")
-          .map((ext) => ext.toLowerCase())
+          .map((ext) => normalizeLowercaseStringOrEmpty(ext))
       : [""];
   for (const dir of resolveEnvPath(env)) {
     for (const ext of extensions) {
@@ -337,20 +280,11 @@ function buildExecEventPayload(payload: ExecEventPayload): ExecEventPayload {
   return { ...payload, output: text };
 }
 
-async function sendExecFinishedEvent(params: {
-  client: GatewayClient;
-  sessionKey: string;
-  runId: string;
-  cmdText: string;
-  result: {
-    stdout?: string;
-    stderr?: string;
-    error?: string | null;
-    exitCode?: number | null;
-    timedOut?: boolean;
-    success?: boolean;
-  };
-}) {
+async function sendExecFinishedEvent(
+  params: ExecFinishedEventParams & {
+    client: GatewayClient;
+  },
+) {
   const combined = [params.result.stdout, params.result.stderr, params.result.error]
     .filter(Boolean)
     .join("\n");
@@ -361,17 +295,18 @@ async function sendExecFinishedEvent(params: {
       sessionKey: params.sessionKey,
       runId: params.runId,
       host: "node",
-      command: params.cmdText,
+      command: params.commandText,
       exitCode: params.result.exitCode ?? undefined,
       timedOut: params.result.timedOut,
       success: params.result.success,
       output: combined,
+      suppressNotifyOnExit: params.suppressNotifyOnExit,
     }),
   );
 }
 
 async function runViaMacAppExecHost(params: {
-  approvals: ReturnType<typeof resolveExecApprovals>;
+  approvals: ExecApprovalsResolved;
   request: ExecHostRequest;
 }): Promise<ExecHostResponse | null> {
   const { approvals, request } = params;
@@ -429,7 +364,7 @@ export async function handleInvoke(
   client: GatewayClient,
   skillBins: SkillBinsProvider,
 ) {
-  const command = String(frame.command ?? "");
+  const command = frame.command ?? "";
   if (command === "system.execApprovals.get") {
     try {
       ensureExecApprovals();
@@ -443,7 +378,9 @@ export async function handleInvoke(
       await sendJsonPayloadResult(client, frame, payload);
     } catch (err) {
       const message = String(err);
-      const code = message.toLowerCase().includes("timed out") ? "TIMEOUT" : "INVALID_REQUEST";
+      const code = normalizeLowercaseStringOrEmpty(message).includes("timed out")
+        ? "TIMEOUT"
+        : "INVALID_REQUEST";
       await sendErrorResult(client, frame, code, message);
     }
     return;
@@ -490,10 +427,34 @@ export async function handleInvoke(
     return;
   }
 
-  if (command === "browser.proxy") {
+  try {
+    const pluginNodeHostResult = await invokeRegisteredNodeHostCommand(command, frame.paramsJSON);
+    if (pluginNodeHostResult !== null) {
+      await sendRawPayloadResult(client, frame, pluginNodeHostResult);
+      return;
+    }
+  } catch (err) {
+    await sendInvalidRequestResult(client, frame, err);
+    return;
+  }
+
+  if (command === "system.run.prepare") {
     try {
-      const payload = await runBrowserProxyCommand(frame.paramsJSON);
-      await sendRawPayloadResult(client, frame, payload);
+      const params = decodeParams<{
+        command?: unknown;
+        rawCommand?: unknown;
+        cwd?: unknown;
+        agentId?: unknown;
+        sessionKey?: unknown;
+      }>(frame.paramsJSON);
+      const prepared = buildSystemRunApprovalPlan(params);
+      if (!prepared.ok) {
+        await sendErrorResult(client, frame, "INVALID_REQUEST", prepared.message);
+        return;
+      }
+      await sendJsonPayloadResult(client, frame, {
+        plan: prepared.plan,
+      });
     } catch (err) {
       await sendInvalidRequestResult(client, frame, err);
     }
@@ -518,316 +479,40 @@ export async function handleInvoke(
     return;
   }
 
-  const argv = params.command.map((item) => String(item));
-  const rawCommand = typeof params.rawCommand === "string" ? params.rawCommand.trim() : "";
-  const consistency = validateSystemRunCommandConsistency({
-    argv,
-    rawCommand: rawCommand || null,
-  });
-  if (!consistency.ok) {
-    await sendErrorResult(client, frame, "INVALID_REQUEST", consistency.message);
-    return;
-  }
-
-  const shellCommand = consistency.shellCommand;
-  const cmdText = consistency.cmdText;
-  const agentId = params.agentId?.trim() || undefined;
-  const cfg = loadConfig();
-  const agentExec = agentId ? resolveAgentConfig(cfg, agentId)?.tools?.exec : undefined;
-  const configuredSecurity = resolveExecSecurity(agentExec?.security ?? cfg.tools?.exec?.security);
-  const configuredAsk = resolveExecAsk(agentExec?.ask ?? cfg.tools?.exec?.ask);
-  const approvals = resolveExecApprovals(agentId, {
-    security: configuredSecurity,
-    ask: configuredAsk,
-  });
-  const security = approvals.agent.security;
-  const ask = approvals.agent.ask;
-  const autoAllowSkills = approvals.agent.autoAllowSkills;
-  const sessionKey = params.sessionKey?.trim() || "node";
-  const runId = params.runId?.trim() || crypto.randomUUID();
-  const env = sanitizeEnv(params.env ?? undefined);
-  const safeBins = resolveSafeBins(agentExec?.safeBins ?? cfg.tools?.exec?.safeBins);
-  const trustedSafeBinDirs = getTrustedSafeBinDirs();
-  const bins = autoAllowSkills ? await skillBins.current() : new Set<string>();
-  let analysisOk = false;
-  let allowlistMatches: ExecAllowlistEntry[] = [];
-  let allowlistSatisfied = false;
-  let segments: ExecCommandSegment[] = [];
-  if (shellCommand) {
-    const allowlistEval = evaluateShellAllowlist({
-      command: shellCommand,
-      allowlist: approvals.allowlist,
-      safeBins,
-      cwd: params.cwd ?? undefined,
-      env,
-      trustedSafeBinDirs,
-      skillBins: bins,
-      autoAllowSkills,
-      platform: process.platform,
-    });
-    analysisOk = allowlistEval.analysisOk;
-    allowlistMatches = allowlistEval.allowlistMatches;
-    allowlistSatisfied =
-      security === "allowlist" && analysisOk ? allowlistEval.allowlistSatisfied : false;
-    segments = allowlistEval.segments;
-  } else {
-    const analysis = analyzeArgvCommand({ argv, cwd: params.cwd ?? undefined, env });
-    const allowlistEval = evaluateExecAllowlist({
-      analysis,
-      allowlist: approvals.allowlist,
-      safeBins,
-      cwd: params.cwd ?? undefined,
-      trustedSafeBinDirs,
-      skillBins: bins,
-      autoAllowSkills,
-    });
-    analysisOk = analysis.ok;
-    allowlistMatches = allowlistEval.allowlistMatches;
-    allowlistSatisfied =
-      security === "allowlist" && analysisOk ? allowlistEval.allowlistSatisfied : false;
-    segments = analysis.segments;
-  }
-  const isWindows = process.platform === "win32";
-  const cmdInvocation = shellCommand
-    ? isCmdExeInvocation(segments[0]?.argv ?? [])
-    : isCmdExeInvocation(argv);
-  if (security === "allowlist" && isWindows && cmdInvocation) {
-    analysisOk = false;
-    allowlistSatisfied = false;
-  }
-
-  const useMacAppExec = process.platform === "darwin";
-  if (useMacAppExec) {
-    const approvalDecision =
-      params.approvalDecision === "allow-once" || params.approvalDecision === "allow-always"
-        ? params.approvalDecision
-        : null;
-    const execRequest: ExecHostRequest = {
-      command: argv,
-      rawCommand: rawCommand || shellCommand || null,
-      cwd: params.cwd ?? null,
-      env: params.env ?? null,
-      timeoutMs: params.timeoutMs ?? null,
-      needsScreenRecording: params.needsScreenRecording ?? null,
-      agentId: agentId ?? null,
-      sessionKey: sessionKey ?? null,
-      approvalDecision,
-    };
-    const response = await runViaMacAppExecHost({ approvals, request: execRequest });
-    if (!response) {
-      if (execHostEnforced || !execHostFallbackAllowed) {
-        await sendNodeEvent(
-          client,
-          "exec.denied",
-          buildExecEventPayload({
-            sessionKey,
-            runId,
-            host: "node",
-            command: cmdText,
-            reason: "companion-unavailable",
-          }),
-        );
-        await sendInvokeResult(client, frame, {
-          ok: false,
-          error: {
-            code: "UNAVAILABLE",
-            message: "COMPANION_APP_UNAVAILABLE: macOS app exec host unreachable",
-          },
-        });
-        return;
-      }
-    } else if (!response.ok) {
-      const reason = response.error.reason ?? "approval-required";
-      await sendNodeEvent(
-        client,
-        "exec.denied",
-        buildExecEventPayload({
-          sessionKey,
-          runId,
-          host: "node",
-          command: cmdText,
-          reason,
-        }),
-      );
-      await sendInvokeResult(client, frame, {
-        ok: false,
-        error: { code: "UNAVAILABLE", message: response.error.message },
-      });
-      return;
-    } else {
-      const result: ExecHostRunResult = response.payload;
-      await sendExecFinishedEvent({ client, sessionKey, runId, cmdText, result });
-      await sendInvokeResult(client, frame, {
-        ok: true,
-        payloadJSON: JSON.stringify(result),
-      });
-      return;
-    }
-  }
-
-  if (security === "deny") {
-    await sendNodeEvent(
-      client,
-      "exec.denied",
-      buildExecEventPayload({
-        sessionKey,
-        runId,
-        host: "node",
-        command: cmdText,
-        reason: "security=deny",
-      }),
-    );
-    await sendInvokeResult(client, frame, {
-      ok: false,
-      error: { code: "UNAVAILABLE", message: "SYSTEM_RUN_DISABLED: security=deny" },
-    });
-    return;
-  }
-
-  const requiresAsk = requiresExecApproval({
-    ask,
-    security,
-    analysisOk,
-    allowlistSatisfied,
-  });
-
-  const approvalDecision =
-    params.approvalDecision === "allow-once" || params.approvalDecision === "allow-always"
-      ? params.approvalDecision
-      : null;
-  const approvedByAsk = approvalDecision !== null || params.approved === true;
-  if (requiresAsk && !approvedByAsk) {
-    await sendNodeEvent(
-      client,
-      "exec.denied",
-      buildExecEventPayload({
-        sessionKey,
-        runId,
-        host: "node",
-        command: cmdText,
-        reason: "approval-required",
-      }),
-    );
-    await sendInvokeResult(client, frame, {
-      ok: false,
-      error: { code: "UNAVAILABLE", message: "SYSTEM_RUN_DENIED: approval required" },
-    });
-    return;
-  }
-  if (approvalDecision === "allow-always" && security === "allowlist") {
-    if (analysisOk) {
-      for (const segment of segments) {
-        const pattern = segment.resolution?.resolvedPath ?? "";
-        if (pattern) {
-          addAllowlistEntry(approvals.file, agentId, pattern);
-        }
-      }
-    }
-  }
-
-  if (security === "allowlist" && (!analysisOk || !allowlistSatisfied) && !approvedByAsk) {
-    await sendNodeEvent(
-      client,
-      "exec.denied",
-      buildExecEventPayload({
-        sessionKey,
-        runId,
-        host: "node",
-        command: cmdText,
-        reason: "allowlist-miss",
-      }),
-    );
-    await sendInvokeResult(client, frame, {
-      ok: false,
-      error: { code: "UNAVAILABLE", message: "SYSTEM_RUN_DENIED: allowlist miss" },
-    });
-    return;
-  }
-
-  if (allowlistMatches.length > 0) {
-    const seen = new Set<string>();
-    for (const match of allowlistMatches) {
-      if (!match?.pattern || seen.has(match.pattern)) {
-        continue;
-      }
-      seen.add(match.pattern);
-      recordAllowlistUse(
-        approvals.file,
-        agentId,
-        match,
-        cmdText,
-        segments[0]?.resolution?.resolvedPath,
-      );
-    }
-  }
-
-  if (params.needsScreenRecording === true) {
-    await sendNodeEvent(
-      client,
-      "exec.denied",
-      buildExecEventPayload({
-        sessionKey,
-        runId,
-        host: "node",
-        command: cmdText,
-        reason: "permission:screenRecording",
-      }),
-    );
-    await sendInvokeResult(client, frame, {
-      ok: false,
-      error: { code: "UNAVAILABLE", message: "PERMISSION_MISSING: screenRecording" },
-    });
-    return;
-  }
-
-  let execArgv = argv;
-  if (
-    security === "allowlist" &&
-    isWindows &&
-    !approvedByAsk &&
-    shellCommand &&
-    analysisOk &&
-    allowlistSatisfied &&
-    segments.length === 1 &&
-    segments[0]?.argv.length > 0
-  ) {
-    execArgv = segments[0].argv;
-  }
-
-  const result = await runCommand(
-    execArgv,
-    params.cwd?.trim() || undefined,
-    env,
-    params.timeoutMs ?? undefined,
-  );
-  if (result.truncated) {
-    const suffix = "... (truncated)";
-    if (result.stderr.trim().length > 0) {
-      result.stderr = `${result.stderr}\n${suffix}`;
-    } else {
-      result.stdout = `${result.stdout}\n${suffix}`;
-    }
-  }
-  await sendExecFinishedEvent({ client, sessionKey, runId, cmdText, result });
-
-  await sendInvokeResult(client, frame, {
-    ok: true,
-    payloadJSON: JSON.stringify({
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      success: result.success,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      error: result.error ?? null,
-    }),
+  await handleSystemRunInvoke({
+    client,
+    params,
+    skillBins,
+    execHostEnforced,
+    execHostFallbackAllowed,
+    resolveExecSecurity,
+    resolveExecAsk,
+    isCmdExeInvocation,
+    sanitizeEnv,
+    runCommand,
+    runViaMacAppExecHost,
+    sendNodeEvent,
+    buildExecEventPayload,
+    sendInvokeResult: async (result) => {
+      await sendInvokeResult(client, frame, result);
+    },
+    sendExecFinishedEvent: async ({ sessionKey, runId, commandText, result }) => {
+      await sendExecFinishedEvent({ client, sessionKey, runId, commandText, result });
+    },
+    preferMacAppExecHost,
   });
 }
 
+// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- CLI JSON params are typed by the invoked method.
 function decodeParams<T>(raw?: string | null): T {
   if (!raw) {
     throw new Error("INVALID_REQUEST: paramsJSON required");
   }
-  return JSON.parse(raw) as T;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error("INVALID_REQUEST: paramsJSON malformed JSON");
+  }
 }
 
 export function coerceNodeInvokePayload(payload: unknown): NodeInvokeRequestPayload | null {

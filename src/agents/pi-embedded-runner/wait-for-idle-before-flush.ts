@@ -4,30 +4,35 @@ type IdleAwareAgent = {
 
 type ToolResultFlushManager = {
   flushPendingToolResults?: (() => void) | undefined;
+  clearPendingToolResults?: (() => void) | undefined;
 };
 
-export const DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS = 30_000;
 
 async function waitForAgentIdleBestEffort(
   agent: IdleAwareAgent | null | undefined,
   timeoutMs: number,
-): Promise<void> {
+): Promise<boolean> {
   const waitForIdle = agent?.waitForIdle;
   if (typeof waitForIdle !== "function") {
-    return;
+    return false;
   }
 
+  const idleResolved = Symbol("idle");
+  const idleTimedOut = Symbol("timeout");
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
-      waitForIdle.call(agent),
-      new Promise<void>((resolve) => {
-        timeoutHandle = setTimeout(resolve, timeoutMs);
+    const outcome = await Promise.race([
+      waitForIdle.call(agent).then(() => idleResolved),
+      new Promise<symbol>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(idleTimedOut), timeoutMs);
         timeoutHandle.unref?.();
       }),
     ]);
+    return outcome === idleTimedOut;
   } catch {
     // Best-effort during cleanup.
+    return false;
   } finally {
     if (timeoutHandle) {
       clearTimeout(timeoutHandle);
@@ -40,6 +45,12 @@ export async function flushPendingToolResultsAfterIdle(opts: {
   sessionManager: ToolResultFlushManager | null | undefined;
   timeoutMs?: number;
 }): Promise<void> {
-  await waitForAgentIdleBestEffort(opts.agent, opts.timeoutMs ?? DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS);
+  const isImmediateTimeout = opts.timeoutMs !== undefined && opts.timeoutMs <= 0;
+  if (!isImmediateTimeout) {
+    await waitForAgentIdleBestEffort(
+      opts.agent,
+      opts.timeoutMs ?? DEFAULT_WAIT_FOR_IDLE_TIMEOUT_MS,
+    );
+  }
   opts.sessionManager?.flushPendingToolResults?.();
 }
